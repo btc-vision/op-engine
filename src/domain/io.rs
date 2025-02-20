@@ -153,11 +153,17 @@ impl<R: Read> ByteReader<R> {
     }
 
     fn read_exact_buf(&mut self, buf: &mut [u8]) -> OpNetResult<()> {
-        let read_bytes = self.inner.read(buf)?;
-        if read_bytes < buf.len() {
-            return Err(OpNetError::new("Not enough bytes to read"));
+        let mut total_read = 0;
+        while total_read < buf.len() {
+            let n = self.inner.read(&mut buf[total_read..])?;
+            if n == 0 {
+                // Reached EOF unexpectedly before filling `buf`
+                return Err(OpNetError::new("Not enough bytes to read"));
+            }
+            total_read += n;
         }
-        self.offset += read_bytes;
+
+        self.offset += total_read;
         Ok(())
     }
 
