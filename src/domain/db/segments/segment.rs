@@ -197,6 +197,7 @@ impl SegmentManager {
             index: Some(Arc::new(btree)),
         };
         self.segments.push(meta);
+        self.segments.sort_by_key(|s| s.start_height);
 
         Ok(())
     }
@@ -540,5 +541,284 @@ mod tests {
         // If we mismatch the key, we get None
         let mismatch = seg_mgr.read_record_from_segment(&seg.file_path, offset, &[9, 9]);
         assert!(mismatch.unwrap().is_none());
+    }
+
+    #[test]
+    fn test_flush_memtable_multiple_times() {
+        // Verifies that multiple flushes create multiple segments and the manager handles them properly.
+        let (_tmp_dir, mut seg_mgr) = make_segment_manager();
+
+        // Flush #1
+        let mut mem_1 = make_memtable(&[(b"hello".to_vec(), b"world".to_vec())]);
+        seg_mgr
+            .flush_memtable_to_segment("coll", &mut mem_1, 10)
+            .unwrap();
+        assert_eq!(seg_mgr.segments.len(), 1);
+
+        // Flush #2
+        let mut mem_2 = make_memtable(&[(b"foo".to_vec(), b"bar".to_vec())]);
+        seg_mgr
+            .flush_memtable_to_segment("coll", &mut mem_2, 11)
+            .unwrap();
+        assert_eq!(seg_mgr.segments.len(), 2);
+
+        // Check segment ordering
+        assert_eq!(seg_mgr.segments[0].start_height, 10);
+        assert_eq!(seg_mgr.segments[1].start_height, 11);
+
+        // Retrieve from first segment (hello->world) and second (foo->bar)
+        let found1 = seg_mgr.find_value_for_key("coll", b"hello").unwrap();
+        assert_eq!(found1, Some(b"world".to_vec()));
+        let found2 = seg_mgr.find_value_for_key("coll", b"foo").unwrap();
+        assert_eq!(found2, Some(b"bar".to_vec()));
+    }
+
+    #[test]
+    fn test_flush_memtable_concurrent_calls() {
+        // Check that calling flush concurrently from multiple threads does not corrupt data or panic.
+        // We'll spawn N threads, each flushes a different memtable. Because of `flush_lock`, they should
+        // effectively serialize, but we ensure the final state is correct.
+
+        use std::thread;
+
+        let (_tmp_dir, seg_mgr) = make_segment_manager();
+        let seg_mgr_arc = Arc::new(Mutex::new(seg_mgr));
+
+        let mut handles = vec![];
+        for i in 0..5 {
+            let seg_mgr_clone = seg_mgr_arc.clone();
+            handles.push(thread::spawn(move || {
+                let mut mem = make_memtable(&[(
+                    format!("key{i}").into_bytes(),
+                    format!("val{i}").into_bytes(),
+                )]);
+                // Acquire a lock on seg_mgr and flush
+                let mut guard = seg_mgr_clone.lock().unwrap();
+                guard
+                    .flush_memtable_to_segment("concurrent", &mut mem, 100 + i as u64)
+                    .unwrap();
+            }));
+        }
+
+        // Join all threads
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // Now check we have 5 segments in ascending block height order
+        let seg_mgr_final = seg_mgr_arc.lock().unwrap();
+        assert_eq!(
+            seg_mgr_final.segments.len(),
+            5,
+            "Should have 5 segments from concurrent flush"
+        );
+        for (i, seg) in seg_mgr_final.segments.iter().enumerate() {
+            assert_eq!(seg.start_height, 100 + i as u64);
+            // Retrieve the key from each
+            let key = format!("key{i}");
+            let val = format!("val{i}");
+            let found = seg_mgr_final
+                .find_value_for_key("concurrent", key.as_bytes())
+                .unwrap();
+            assert_eq!(found, Some(val.into_bytes()));
+        }
+    }
+
+    #[test]
+    fn test_rollback_to_same_height_no_removal() {
+        // Rolling back to exactly the highest segment's end_height should not remove that segment.
+        let (_tmp_dir, mut seg_mgr) = make_segment_manager();
+
+        // Create a segment at block=10
+        let mut mem = make_memtable(&[(b"cat".to_vec(), b"meow".to_vec())]);
+        seg_mgr
+            .flush_memtable_to_segment("test", &mut mem, 10)
+            .unwrap();
+        assert_eq!(seg_mgr.segments.len(), 1);
+
+        // Rolling back to the same height => no removal
+        seg_mgr.rollback_to_height(10).unwrap();
+        assert_eq!(
+            seg_mgr.segments.len(),
+            1,
+            "Segment at block=10 should remain if rollback=10"
+        );
+    }
+
+    #[test]
+    fn test_discover_existing_segments_malformed_filenames() {
+        // Ensure that malformed filenames are skipped or do not panic the system.
+        let tmp_dir = TempDir::new().unwrap();
+        create_dir_all(tmp_dir.path()).unwrap();
+
+        // Create some random files that do not match the naming pattern
+        let bad_seg_1 = tmp_dir.path().join("collectionNoHeights.seg"); // no '_' in name
+        let bad_seg_2 = tmp_dir.path().join("coll_abc_def.seg"); // not numeric
+        let bad_seg_3 = tmp_dir.path().join("partial_20.seg.bak"); // extra extension
+        let _ = File::create(&bad_seg_1).unwrap();
+        let _ = File::create(&bad_seg_2).unwrap();
+        let _ = File::create(&bad_seg_3).unwrap();
+
+        // Create a valid segment
+        let good_seg = tmp_dir.path().join("real_5_6.seg");
+        File::create(&good_seg).unwrap();
+
+        // Now discover
+        let tp = Arc::new(Mutex::new(ThreadPool::new(2)));
+        let seg_mgr = SegmentManager::new(tmp_dir.path(), tp).unwrap();
+
+        // We should see exactly 1 discovered segment (the good one).
+        assert_eq!(
+            seg_mgr.segments.len(),
+            1,
+            "Only the valid segment is discovered"
+        );
+        assert_eq!(seg_mgr.segments[0].start_height, 5);
+        assert_eq!(seg_mgr.segments[0].end_height, 6);
+    }
+
+    #[test]
+    fn test_read_record_from_segment_out_of_bounds_offset() {
+        // We test the case where the offset is bigger than the file size, so the read fails.
+        // `read_var_bytes()` should error. We'll forcibly insert a segment with an invalid offset
+        // to see that the method returns `Ok(None)` or an error. (Your code might differ.)
+
+        let (_tmp_dir, mut seg_mgr) = make_segment_manager();
+
+        // Create an actual .seg file with a single record
+        let mut mem = make_memtable(&[(b"abc".to_vec(), b"def".to_vec())]);
+        seg_mgr
+            .flush_memtable_to_segment("test", &mut mem, 1)
+            .unwrap();
+        assert_eq!(seg_mgr.segments.len(), 1);
+
+        // Manually modify the BTree to produce an impossible offset
+        let seg = &mut seg_mgr.segments[0];
+        if let Some(ref mut btree) = Arc::get_mut(&mut seg.index.as_mut().unwrap()) {
+            // Insert a key with offset = 9999999 => out of file bounds
+            btree.insert(b"bogus".to_vec(), 9_999_999);
+        }
+
+        // Try reading that bogus key => we want to see if read_record_from_segment gracefully returns None or an error.
+        let maybe_val = seg_mgr.find_value_for_key("test", b"bogus");
+        match maybe_val {
+            Ok(None) => {
+                // This is acceptable if the read fails partially and yields None
+            }
+            Err(e) => {
+                // Also possible if read leads to an I/O error. We won't assert which is correct;
+                // either is valid so long as we don't panic.
+                println!("Got an error as expected: {}", e);
+            }
+            Ok(Some(_)) => panic!("Should not successfully read a key at invalid offset!"),
+        }
+    }
+
+    #[test]
+    fn test_performance_flush_and_read() {
+        use std::time::Instant;
+
+        // We’ll measure how long it takes to:
+        // 1) flush multiple large memtables,
+        // 2) read random keys back.
+
+        // Adjust these for your desired test scale
+        const NUM_FLUSHES: usize = 5;
+        const ITEMS_PER_FLUSH: usize = 100_000;
+
+        // Create fresh SegmentManager
+        let (_tmp_dir, mut seg_mgr) = make_segment_manager();
+
+        // 1) Measure the time to flush multiple memtables
+        let start_flush = Instant::now();
+        for flush_index in 0..NUM_FLUSHES {
+            let mut data = Vec::with_capacity(ITEMS_PER_FLUSH);
+            for i in 0..ITEMS_PER_FLUSH {
+                // Key and value as bytes
+                let key = format!("key-{}-{}", flush_index, i).into_bytes();
+                let val = format!("val-{}-{}", flush_index, i).into_bytes();
+                data.push((key, val));
+            }
+            let mut memtable = make_memtable(&data);
+            seg_mgr
+                .flush_memtable_to_segment("perf_test", &mut memtable, 1000 + flush_index as u64)
+                .expect("flush memtable failed");
+        }
+        let flush_duration = start_flush.elapsed();
+        println!(
+            "Flushed {} memtables of {} items each in: {:?}",
+            NUM_FLUSHES, ITEMS_PER_FLUSH, flush_duration
+        );
+
+        // 2) Measure the time to read random keys from the segments
+        use rand::{rng, Rng};
+        let mut rng = rng();
+        let start_read = Instant::now();
+        // We'll do some random lookups
+        let lookups = 50000;
+        for _ in 0..lookups {
+            // pick a flush index and an item index
+            let f_idx = rng.random_range(0..NUM_FLUSHES);
+            let i_idx = rng.random_range(0..ITEMS_PER_FLUSH);
+            let key_bytes = format!("key-{}-{}", f_idx, i_idx).into_bytes();
+
+            // Attempt to find it
+            let found = seg_mgr.find_value_for_key("perf_test", &key_bytes).unwrap();
+            // We expect it to exist
+            assert!(found.is_some(), "Failed to find a key that should exist");
+        }
+        let read_duration = start_read.elapsed();
+        println!(
+            "Performed {} random lookups in: {:?}",
+            lookups, read_duration
+        );
+    }
+
+    #[test]
+    fn test_discover_valid_index_file() {
+        // 1) Create a SegmentManager and flush a MemTable to produce a .seg and .idx on disk
+        let (tmp_dir, mut seg_mgr) = make_segment_manager();
+
+        // Write out a memtable with a single key-value pair
+        let mut memtable = make_memtable(&[(b"discovery_key".to_vec(), b"discovery_val".to_vec())]);
+        seg_mgr
+            .flush_memtable_to_segment("disc", &mut memtable, 42)
+            .expect("Flush should succeed");
+
+        // Confirm we have exactly one segment
+        assert_eq!(seg_mgr.segments.len(), 1, "One segment after flush");
+        // Also confirm the .idx file actually exists
+        let seg_file_name = format!("disc_{}_{}.seg", 42, 42);
+        let idx_file_name = format!("disc_{}_{}.idx", 42, 42);
+        let seg_path = tmp_dir.path().join(seg_file_name);
+        let idx_path = tmp_dir.path().join(idx_file_name);
+        assert!(seg_path.exists(), "Segment file must exist");
+        assert!(idx_path.exists(), "Index file must exist");
+
+        // 2) Create a *new* SegmentManager pointing to the same directory.
+        //    This forces discover_existing_segments() to run and load the .idx from disk.
+        drop(seg_mgr); // drop the old manager
+        let tp = Arc::new(Mutex::new(ThreadPool::new(2)));
+        let seg_mgr2 = SegmentManager::new(tmp_dir.path(), tp)
+            .expect("Re-initializing SegmentManager should succeed");
+
+        // 3) Now the discovered segment should have a non-empty index
+        assert_eq!(seg_mgr2.segments.len(), 1, "Should discover 1 segment");
+        let seg_meta = &seg_mgr2.segments[0];
+        assert!(
+            seg_meta.index.is_some(),
+            "The discovered segment's index should be Some(...)"
+        );
+
+        // 4) Confirm that we can read the same key via find_value_for_key,
+        //    which demonstrates that `BTreeIndex::read_from_disk` actually returned Ok(btree).
+        let found = seg_mgr2
+            .find_value_for_key("disc", b"discovery_key")
+            .expect("find_value_for_key should not error");
+        assert_eq!(
+            found,
+            Some(b"discovery_val".to_vec()),
+            "Should read the correct value from the discovered index"
+        );
     }
 }
