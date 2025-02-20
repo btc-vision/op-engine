@@ -1,124 +1,147 @@
-# Merkle Tree Library
+# OP-Engine: A High-Throughput, Reorg-Aware Rust Storage Layer
 
-![Rust](https://img.shields.io/badge/rust-%23000000.svg?style=for-the-badge&logo=rust&logoColor=white)
-![NodeJS](https://img.shields.io/badge/Node%20js-339933?style=for-the-badge&logo=nodedotjs&logoColor=white)
-![NPM](https://img.shields.io/badge/npm-CB3837?style=for-the-badge&logo=npm&logoColor=white)
+OP-Engine is a Rust-based storage engine tailored for **OPNet**, an overlay protocol that adds smart-contract capabilities on top of Bitcoin. This system is designed to handle massive reads/writes, large data sizes (terabytes), and complex reorganization (reorg) requirements — all while offering flexible indexing, crash safety, and both hot/cold storage tiers.
 
-![SHA-256](https://img.shields.io/badge/SHA--256-cryptographic-blue)
-
-**Package**: `@btc-vision/op-engine`
-
-## Overview
-
-This project aims to develop a high-performance, secure Merkle tree library in Rust, with seamless integration for both
-Rust and Node.js applications. The library leverages SHA-256 as its cryptographic hash function and is designed to be
-secure against known vulnerabilities, ensuring robust state proof validations. Optimized for both performance and
-security, this library is intended for use in applications that require strong data integrity and validation mechanisms.
-
-## Key Features
-
-- **SHA-256 Hashing**: Utilizes the SHA-256 hashing algorithm to ensure cryptographic security.
-- **Cross-Platform**: Designed for both Rust and Node.js environments, providing bindings for easy integration.
-- **Secure Against Exploits**: Implements protections against known vulnerabilities like hash collisions and tree
-  manipulation.
-- **Optimized Performance**: Significantly improved speed and efficiency compared to existing Merkle tree
-  implementations like `merkle-tree-sha256`.
-- **Comprehensive Testing**: Includes a suite of tests to ensure the library performs securely and accurately.
+---
 
 ## Table of Contents
 
-- [Project Overview](#overview)
-- [Key Features](#key-features)
-- [Getting Started](#getting-started)
-- [Usage](#usage)
-    - [Rust Usage](#rust-usage)
-    - [Node.js Usage](#nodejs-usage)
-- [Installation](#installation)
-- [References](#references)
-- [Contributing](#contributing)
+1. [Overview](#overview)
+2. [Key Features](#key-features)
+3. [Architecture](#architecture)
+    1. [Data Model & Collections](#data-model--collections)
+    2. [Hot vs Cold Storage](#hot-vs-cold-storage)
+    3. [Concurrency & Threading](#concurrency--threading)
+    4. [Memory Management](#memory-management)
+    5. [Persistence & Failsafe](#persistence--failsafe)
+4. [Reorg Handling](#reorg-handling)
+5. [Serialization](#serialization)
+6. [Indexing](#indexing)
+7. [Creating a New Collection](#creating-a-new-collection)
+10. [License](#license)
 
-## Getting Started
+---
 
-### Prerequisites
+## Overview
 
-- **Rust**: Ensure you have Rust installed. The recommended version is stable 1.56+.
-- **Node.js**: Version 16 or higher is required.
-- **napi-rs**: Used to interface the Rust code with Node.js.
+- **Purpose**: Manage all data for OPNet (e.g. blocks, transactions, UTXOs, contract states) with high throughput and robust support for Bitcoin-like chain reorganizations.
+- **Core Requirements**:
+    1. **Threading** for parallel reads/writes.
+    2. **In-memory caching** and deferring writes to disk.
+    3. **Crash recovery** through write-ahead logs (WAL).
+    4. **Full reorg support**: revert to a previous chain state seamlessly.
+    5. **Optimized** for large-scale blockchain data (terabytes).
+    6. **Dynamic** support for various hardware environments.
+    7. **Hot/Cold** storage for performance vs. cost trade-offs.
+    8. **Multiple indexes** and composite keys for advanced queries.
+    9. **Custom serialization** for efficient, binary-based data encoding (no JSON).
 
-### Installation
+---
 
-1. **Clone the repository**:
+## Key Features
 
-   ```bash
-   git clone git://github.com/btc-vision/op-engine.git
-   cd op-engine
-   ```
+- **Multi-threaded**: Uses Rust concurrency primitives to safely handle high-volume parallel operations.
+- **Collection-based**: Each type of data (blocks, transactions, UTXOs, etc.) is stored in its own “collection,” with configurable indexes and schemas.
+- **In-memory & On-disk**: Keeps recent writes in memory for speed, flushes periodically to disk or cold storage.
+- **Crash Safety**: WAL-based approach ensures minimal data loss; can replay uncommitted transactions after a crash.
+- **Reorganization Support**: Can revert to a previous block height on demand, discarding orphaned chain data.
+- **Hot vs. Cold**: Move older data to cheaper/slower media, reduce the footprint of frequently-accessed data.
 
-2. **Install dependencies**:
+---
 
-   ```bash
-   npm install
-   ```
+## Architecture
 
-3. **Build the project**:
+### Data Model & Collections
 
-   For production build:
+**OP-Engine** organizes all data into **collections**. Each collection corresponds to a specific data type:
 
-   ```bash
-   npm run build
-   ```
+- **Blocks** (block headers, raw block data, metadata)
+- **Transactions** (raw bytes, indexed by TxID, block pointer, etc.)
+- **UTXOs** (indexed by `(TxID, outputIndex)` and address or script)
+- **Smart Contracts** (state data, possibly multi-indexed)
+- **Wallet/Key** metadata (public keys, user data)
 
-   For debug build:
+Each collection defines:
+- **Primary Index**: Uniquely identifies an item (e.g., `(TxID, outputIndex)` for UTXOs).
+- **Optional Secondary Indices**: For queries by different fields (e.g., `address -> [UTXOs]`).
+- **Custom serialization** rules.
 
-   ```bash
-   npm run build:debug
-   ```
+**Data Flow**:
+1. **Incoming Data** → **In-memory store (memtable)** → (optionally) → **WAL** → **Flush to segment files on disk**.
+2. **Lookups** check memtable first, then disk/cold storage segments.
 
-4. **Run tests**:
+---
 
-   ```bash
-   npm test
-   ```
+### Hot vs Cold Storage
 
-## Usage
+1. **Hot Storage**:
+    - Typically an SSD or high-speed disk.
+    - Stores recent data (e.g., the last `N` blocks, unspent UTXOs).
+    - Enables quick lookups and updates.
 
-### Node.js Usage
+2. **Cold Storage**:
+    - Could be a slower HDD, tape, or remote object store.
+    - Stores finalized (deep) chain data.
+    - Often compressed or archived to save space.
 
-For Node.js integration, the library provides bindings via N-API.
+**Policy**: Configurable. E.g.:
+- _“After `X` confirmations, move the block or transaction data to cold storage.”_
 
-1. Install the package:
+---
 
-   ```bash
-   npm install @btc-vision/op-engine
-   ```
+### Concurrency & Threading
 
-2. Example of creating a Merkle tree:
+- **Thread-Pool**: A pool of worker threads can handle read/write operations in parallel.
+- **Sharded Collections**: Optionally split large data sets by key range or hash (e.g., shard by `TxID` prefix). Each shard manages its own WAL and memtable to reduce contention.
+- **Locking**:
+    - Fine-grained locks at the shard or index level, rather than global locks.
+    - Or use lock-free/atomic data structures where possible (e.g., crossbeam skiplist, concurrent B-Trees).
 
-   ```typescript
-   import { MerkleTree } from '@btc-vision/op-engine';
+---
 
-   const leaves: Uint8Array[] = [
-       Uint8Array.from([100, 97, 116, 97, 49]),
-       Uint8Array.from([100, 97, 116, 97, 50]),
-       Uint8Array.from([100, 97, 116, 97, 51]),
-   ];
-   const tree = new MerkleTree(leaves);
-   console.log('Merkle Root:', tree.root());
-   ```
+### Memory Management
 
-## References
+1. **In-Memory Caches** (Memtables):
+    - Act as high-speed buffers for writes.
+    - Once a memtable reaches a threshold (size or time-based), it’s flushed (written) to disk.
+2. **Snapshots**:
+    - When flushing, create a snapshot (checkpoint) of the state to allow crash recovery.
+    - The snapshot references a consistent set of on-disk segment files + offsets.
 
-- **Current Rust Merkle Tree Implementation**: [rs-merkle](https://github.com/antouhou/rs-merkle)
-- **SHA-256 Merkle Tree for Node.js**: [merkle-tree-sha256](https://github.com/btc-vision/merkle-tree-sha256)
-- **N-API for Rust Integration**: [napi.rs](https://napi.rs/)
+---
 
-Check the `example/` folder for usage examples and to compare performance with the current `merkle-tree-sha256` package.
+### Persistence & Failsafe
 
-## Contributing
+1. **Write-Ahead Log (WAL)**:
+    - Before data is stored in the memtable, it’s written sequentially to a WAL file.
+    - On crash, **replay** the WAL to restore the in-memory data that wasn’t fully flushed.
 
-Contributions are welcome! Please adhere to the code of conduct and sign all commits. Open an issue or submit a pull
-request if you encounter any problems or have suggestions for improving the library.
+2. **Segment Files** (LSM-like Approach):
+    - Flushed memtables become immutable segment files.
+    - Over time, we **merge** segment files to remove outdated entries (e.g., spent UTXOs).
+    - Each segment is versioned with a block height range for easy reorg discards.
 
-## License
+3. **Checkpoints**:
+    - After a successful flush, record a checkpoint that ties the WAL offsets to the newly created segment files.
+    - This checkpoint is used to:
+        - Mark safe WAL segments that can be truncated or archived.
+        - Identify the last consistent state in a crash scenario.
 
-This project is licensed under the MIT License. For more details, please see the [LICENSE](LICENSE) file.
+---
+
+## Reorg Handling
+
+Bitcoin-like reorgs require rolling back all changes after a certain block height:
+
+1. **Snapshot / Delta Approach**:
+    - We keep track of changes per block or per small batch of blocks.
+    - On reorg, discard the segments (or block deltas) that belong to the orphaned chain.
+
+2. **Reorg API**:
+    - A method (e.g. `reorg_to(height: u64)`) triggers the database to:
+        1. Identify segments associated with blocks above `height`.
+        2. Mark or delete them (move them to an "orphaned" state).
+        3. Roll back in-memory indexes to reflect the previous chain’s state.
+
+3. **Consistency**:
+    - Reorg must be atomic across all collections so that blocks, transactions, UTXOs, and contract states are rolled back together.

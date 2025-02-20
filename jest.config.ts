@@ -30,7 +30,7 @@ const config: Config.InitialOptions = {
             },
         ],
     },
-    modulePathIgnorePatterns: ['packages', 'build', 'node_modules', 'config', 'utils'],
+    modulePathIgnorePatterns: ['packages', 'build', 'node_modules', 'config', 'generic'],
     testMatch: [
         '<rootPath>/__test__/**/*.test.ts',
         '<rootPath>/__test__/*.test.ts',

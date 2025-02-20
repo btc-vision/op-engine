@@ -1,2 +1,1 @@
-pub mod merkle_proof;
-pub mod tree;
+pub(crate) mod db;

@@ -310,8 +310,6 @@ if (!nativeBinding) {
   throw new Error(`Failed to load native binding`)
 }
 
-const { MerkleProof, MerkleTree, safeInitRust } = nativeBinding
+const { safeInitRust } = nativeBinding
 
-module.exports.MerkleProof = MerkleProof
-module.exports.MerkleTree = MerkleTree
 module.exports.safeInitRust = safeInitRust
