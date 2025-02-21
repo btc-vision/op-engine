@@ -2,8 +2,11 @@ use std::collections::VecDeque;
 use std::io::{Read, Write};
 
 use crate::domain::generic::errors::{OpNetError, OpNetResult};
+
+/// Max keys per node (for simplicity).
 const MAX_KEYS: usize = 256;
 
+/// A helper struct for BFS-based deserialization.
 struct NodeMeta {
     is_leaf: bool,
     keys: Vec<Vec<u8>>,
@@ -15,7 +18,6 @@ struct NodeMeta {
 struct BTreeNode {
     keys: Vec<Vec<u8>>,
     values: Vec<u64>,
-    /// Store children as boxes
     children: Vec<Box<BTreeNode>>,
     is_leaf: bool,
 }
@@ -66,14 +68,27 @@ impl BTreeIndex {
         }
     }
 
-    /// Look up a key in the B-Tree.
+    /// Look up a single key in the B-Tree.
     pub fn get(&self, key: &[u8]) -> Option<u64> {
         search_node(&self.root, key)
     }
 
-    /// Write *the entire B-Tree* to `w` in BFS order.
+    /// Return all `(key, offset)` pairs in the inclusive range `[start_key..end_key]`,
+    /// up to `limit`. An in-order traversal is used to maintain ascending order of keys.
     ///
-    /// Note the fix: we now store `is_leaf` as exactly 1 byte.
+    /// If you only need the offsets, you can drop the `key` in the result tuple.
+    pub fn range_search(
+        &self,
+        start_key: &[u8],
+        end_key: &[u8],
+        limit: Option<usize>,
+    ) -> Vec<(Vec<u8>, u64)> {
+        let mut results = Vec::new();
+        range_search_node(&self.root, start_key, end_key, limit, &mut results);
+        results
+    }
+
+    /// Write the entire B-Tree to `w` in BFS order.
     pub fn write_to_disk<W: Write>(&self, w: &mut W) -> OpNetResult<()> {
         let mut queue = VecDeque::new();
         queue.push_back(&self.root);
@@ -95,7 +110,7 @@ impl BTreeIndex {
 
         // 2) Write each node in BFS order
         for node in bfs_nodes {
-            // Write one byte for is_leaf (0 or 1)
+            // Write one byte for is_leaf
             let leaf_byte = if node.is_leaf { 1 } else { 0 };
             w.write_all(&[leaf_byte])
                 .map_err(|e| OpNetError::new(&format!("B-Tree write leaf: {}", e)))?;
@@ -125,9 +140,6 @@ impl BTreeIndex {
     }
 
     /// Read a B-Tree from `r` that was written in BFS order by `write_to_disk`.
-    /// Note the fixes:
-    ///   - We read `is_leaf` as 1 byte (not 8).
-    ///   - We add checks to prevent huge allocations.
     pub fn read_from_disk<R: Read>(r: &mut R) -> OpNetResult<Self> {
         // 1) Read node_count (8 bytes)
         let mut buf8 = [0u8; 8];
@@ -194,7 +206,7 @@ impl BTreeIndex {
             });
         }
 
-        // 3) Create a Vec<Box<BTreeNode>> of all nodes, preserving BFS order
+        // 3) Create node list in BFS order
         let mut nodes: Vec<Box<BTreeNode>> = Vec::with_capacity(node_count);
         for meta in &meta_vec {
             nodes.push(Box::new(BTreeNode {
@@ -205,10 +217,7 @@ impl BTreeIndex {
             }));
         }
 
-        // 4) Link children in BFS order
-        //
-        // Because the nodes are in BFS order in meta_vec, the children of node i
-        // are exactly the next `child_count` nodes in the array, in sequence.
+        // 4) Link children
         let mut next_child_index = 1;
         for (i, meta) in meta_vec.iter().enumerate() {
             let child_count = meta.child_count;
@@ -217,36 +226,38 @@ impl BTreeIndex {
             }
 
             let end = next_child_index + child_count;
-            // If our BFS metadata is correct, 'end' must be <= node_count
             if end > node_count {
                 return Err(OpNetError::new(&format!(
-                    "B-Tree read: invalid child_count at node {} (would exceed total nodes).",
+                    "B-Tree read: invalid child_count at node {} (exceeds total).",
                     i
                 )));
             }
 
-            // Move each child out of the vector and into the parent's children
             for _ in next_child_index..end {
-                let child_node = std::mem::replace(
-                    &mut nodes[next_child_index],
-                    Box::new(BTreeNode::new(true)), // dummy
-                );
+                let child_node =
+                    std::mem::replace(&mut nodes[next_child_index], Box::new(BTreeNode::new(true)));
                 nodes[i].children.push(child_node);
                 next_child_index += 1;
             }
         }
 
-        // The root is the first node in BFS
+        // The root is the first node
         let root = *nodes.remove(0);
         Ok(BTreeIndex { root })
     }
 }
 
-/// Inserts (key, offset) into a node known not to be full.
+// --------------------------------------------------------
+//  Internal Helper Routines
+// --------------------------------------------------------
+
+/// Insert (key, offset) into a node known not to be full.
 fn insert_non_full(node: &mut BTreeNode, key: Vec<u8>, offset: u64) {
     if node.is_leaf {
+        // Insert into the keys array in sorted order
         let pos = match node.keys.binary_search(&key) {
             Ok(pos) => {
+                // Key already exists => update
                 node.values[pos] = offset;
                 return;
             }
@@ -255,6 +266,7 @@ fn insert_non_full(node: &mut BTreeNode, key: Vec<u8>, offset: u64) {
         node.keys.insert(pos, key);
         node.values.insert(pos, offset);
     } else {
+        // Find child
         let mut i = match node.keys.binary_search(&key) {
             Ok(pos) => {
                 node.values[pos] = offset;
@@ -262,6 +274,7 @@ fn insert_non_full(node: &mut BTreeNode, key: Vec<u8>, offset: u64) {
             }
             Err(pos) => pos,
         };
+        // If that child is full, split
         if node.children[i].keys.len() == MAX_KEYS {
             split_child(node, i);
             if key > node.keys[i] {
@@ -272,15 +285,15 @@ fn insert_non_full(node: &mut BTreeNode, key: Vec<u8>, offset: u64) {
     }
 }
 
-/// Splits `parent.children[child_index]` into two nodes around the median key
-/// and promotes that median key into `parent`.
+/// Split child `child_index` of `parent` around the median key, promoting that
+/// median up into the parent.
 fn split_child(parent: &mut BTreeNode, child_index: usize) {
     let mid = MAX_KEYS / 2;
     let child = &mut parent.children[child_index];
 
     let mut new_node = BTreeNode::new(child.is_leaf);
 
-    // Move keys/values from [mid+1..] into new_node
+    // Move [mid+1..] keys/values to new_node
     new_node.keys.extend_from_slice(&child.keys[mid + 1..]);
     new_node.values.extend_from_slice(&child.values[mid + 1..]);
 
@@ -293,19 +306,16 @@ fn split_child(parent: &mut BTreeNode, child_index: usize) {
     let up_key = child.keys[mid].clone();
     let up_val = child.values[mid];
 
-    // Truncate the old child
     child.keys.truncate(mid);
     child.values.truncate(mid);
 
-    // Insert into parent
     parent.keys.insert(child_index, up_key);
     parent.values.insert(child_index, up_val);
 
-    // Push the new_node as a box
     parent.children.insert(child_index + 1, Box::new(new_node));
 }
 
-/// Recursively searches for `key` starting at `node`.
+/// Find a single key recursively.
 fn search_node(node: &BTreeNode, key: &[u8]) -> Option<u64> {
     match node
         .keys
@@ -319,6 +329,61 @@ fn search_node(node: &BTreeNode, key: &[u8]) -> Option<u64> {
                 search_node(&node.children[pos], key)
             }
         }
+    }
+}
+
+/// Recursively search [start_key..end_key] in ascending order.
+/// Collect up to `limit` results, storing `(key, offset)` in `results`.
+///
+/// If limit is None, collects all. If limit is Some(n), we stop after n results.
+fn range_search_node(
+    node: &BTreeNode,
+    start_key: &[u8],
+    end_key: &[u8],
+    limit: Option<usize>,
+    results: &mut Vec<(Vec<u8>, u64)>,
+) {
+    // We'll do an in-order traversal:
+    //   for i in 0..keys.len():
+    //     explore children[i] (if not leaf)
+    //     check keys[i]
+    //   then children[last] if not leaf
+    //
+    // We skip keys < start_key or keys > end_key, but we must still recurse children if needed.
+    let mut i = 0;
+    while i < node.keys.len() {
+        // Recurse left child first
+        if !node.is_leaf {
+            range_search_node(&node.children[i], start_key, end_key, limit, results);
+            // If we've reached our limit, stop
+            if let Some(lim) = limit {
+                if results.len() >= lim {
+                    return;
+                }
+            }
+        }
+
+        // Now check the node.keys[i]
+        let key_slice = &node.keys[i];
+        if key_slice.as_slice() >= start_key && key_slice.as_slice() <= end_key {
+            results.push((key_slice.clone(), node.values[i]));
+            if let Some(lim) = limit {
+                if results.len() >= lim {
+                    return;
+                }
+            }
+        } else if key_slice.as_slice() > end_key {
+            // Because keys are sorted ascending, if we found one that's > end_key,
+            // we can stop scanning further keys in this node.
+            return;
+        }
+
+        i += 1;
+    }
+
+    // Finally, recurse the rightmost child
+    if !node.is_leaf {
+        range_search_node(&node.children[i], start_key, end_key, limit, results);
     }
 }
 
@@ -539,5 +604,74 @@ mod tests {
 
         let btree = BTreeIndex::read_from_disk(&mut Cursor::new(buffer)).unwrap();
         assert_eq!(btree.get(b"anything"), None, "Tree should be empty");
+    }
+
+    #[test]
+    fn test_btree_range_search() {
+        let mut btree = BTreeIndex::new();
+        // Insert a set of keys in lexicographical order
+        let items = [
+            (b"apple".to_vec(), 100),
+            (b"banana".to_vec(), 200),
+            (b"cherry".to_vec(), 300),
+            (b"date".to_vec(), 400),
+            (b"grape".to_vec(), 500),
+            (b"kiwi".to_vec(), 600),
+            (b"orange".to_vec(), 700),
+            (b"zebra".to_vec(), 800),
+        ];
+
+        for (k, v) in &items {
+            btree.insert(k.clone(), *v);
+        }
+
+        // 1) Range search from "banana" to "grape" (inclusive), no limit
+        // Expect: banana(200), cherry(300), date(400), grape(500)
+        let results = btree.range_search(b"banana", b"grape", None);
+        assert_eq!(
+            results,
+            vec![
+                (b"banana".to_vec(), 200),
+                (b"cherry".to_vec(), 300),
+                (b"date".to_vec(), 400),
+                (b"grape".to_vec(), 500),
+            ],
+            "range_search(banana..grape) should return exactly those 4 keys in ascending order"
+        );
+
+        // 2) Same range but limit = Some(2)
+        // Expect only the first 2 hits in ascending order: banana(200), cherry(300)
+        let limited = btree.range_search(b"banana", b"grape", Some(2));
+        assert_eq!(
+            limited,
+            vec![(b"banana".to_vec(), 200), (b"cherry".to_vec(), 300),],
+            "range_search(banana..grape, limit=2) should return the first 2 keys"
+        );
+
+        // 3) Range that covers everything (from "" to "zzzzzz") with no limit
+        // Expect all items in ascending order: apple, banana, cherry, date, grape, kiwi, orange, zebra
+        let full = btree.range_search(b"", b"zzzzzz", None);
+        let expected_all: Vec<(Vec<u8>, u64)> =
+            items.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        assert_eq!(
+            full, expected_all,
+            "range_search(empty..zzzzzz) should return all inserted items"
+        );
+
+        // 4) Range that has no matches, e.g. from "blueberry" to "blueberry"
+        let none = btree.range_search(b"blueberry", b"blueberry", None);
+        assert!(
+            none.is_empty(),
+            "range_search(blueberry..blueberry) should yield no matches"
+        );
+
+        // 5) Just sanity check a range from "banana" to "banana"
+        // Should return only banana, if it exists.
+        let banana_only = btree.range_search(b"banana", b"banana", None);
+        assert_eq!(
+            banana_only,
+            vec![(b"banana".to_vec(), 200)],
+            "range_search(banana..banana) should yield exactly the banana item"
+        );
     }
 }

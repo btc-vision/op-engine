@@ -1,10 +1,11 @@
+// domain/db/collection.rs
 use crate::domain::blockchain::reorg::ReorgManager;
 use crate::domain::db::memtable::MemTable;
 use crate::domain::db::segments::segment::SegmentManager;
 use crate::domain::db::traits::key_provider::KeyProvider;
 use crate::domain::db::wal::WAL;
 use crate::domain::generic::errors::{OpNetError, OpNetResult};
-use crate::domain::io::{ByteReader, ByteWriter};
+use crate::domain::io::{ByteReader, ByteWriter, CustomSerialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -23,12 +24,12 @@ pub struct Collection<T>
 where
     T: KeyProvider,
 {
-    name: String,
-    memtables: Arc<RwLock<HashMap<String, MemTable>>>,
-    wal: Arc<Mutex<WAL>>,
-    segment_manager: Arc<Mutex<SegmentManager>>,
-    reorg_manager: Arc<Mutex<ReorgManager>>,
-    metadata: CollectionMetadata,
+    pub(crate) name: String,
+    pub(crate) memtables: Arc<RwLock<HashMap<String, MemTable>>>,
+    pub(crate) wal: Arc<Mutex<WAL>>,
+    pub(crate) segment_manager: Arc<Mutex<SegmentManager>>,
+    pub(crate) reorg_manager: Arc<Mutex<ReorgManager>>,
+    pub(crate) metadata: CollectionMetadata,
     _phantom: std::marker::PhantomData<T>,
 }
 
@@ -55,8 +56,9 @@ where
         }
     }
 
-    /// Insert a record
+    /// Insert or update a record in this collection.
     pub fn insert(&self, record: T, block_height: u64) -> OpNetResult<()> {
+        // 1) Serialize the record
         let mut buffer = Vec::new();
         {
             let mut writer = ByteWriter::new(&mut buffer);
@@ -64,11 +66,13 @@ where
         }
         let key = record.primary_key();
 
+        // 2) Append to WAL
         {
             let mut wal_guard = self.wal.lock().unwrap();
             wal_guard.append(&buffer)?;
         }
 
+        // 3) Insert into memtable
         {
             let mut mem_guard = self.memtables.write().unwrap();
             let memtable = mem_guard
@@ -76,8 +80,8 @@ where
                 .ok_or_else(|| OpNetError::new("No memtable for collection"))?;
             memtable.insert(key, buffer);
 
+            // 4) If memtable is over size, flush it
             if memtable.current_size() > memtable.max_size() {
-                // flush
                 let mut segmgr = self.segment_manager.lock().unwrap();
                 segmgr.flush_memtable_to_segment(&self.name, memtable, block_height)?;
                 memtable.clear();
@@ -87,10 +91,11 @@ where
         Ok(())
     }
 
-    /// Get by key args
+    /// Get a record by key
     pub fn get(&self, key_args: &T::KeyArgs) -> OpNetResult<Option<T>> {
         let key = T::compose_key(key_args);
 
+        // 1) Check memtable
         {
             let mem_guard = self.memtables.read().unwrap();
             if let Some(memtable) = mem_guard.get(&self.name) {
@@ -102,6 +107,7 @@ where
             }
         }
 
+        // 2) Check segment files
         {
             let segmgr = self.segment_manager.lock().unwrap();
             if let Some(raw) = segmgr.find_value_for_key(&self.name, &key)? {

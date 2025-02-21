@@ -157,7 +157,6 @@ impl<R: Read> ByteReader<R> {
         while total_read < buf.len() {
             let n = self.inner.read(&mut buf[total_read..])?;
             if n == 0 {
-                // Reached EOF unexpectedly before filling `buf`
                 return Err(OpNetError::new("Not enough bytes to read"));
             }
             total_read += n;

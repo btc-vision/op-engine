@@ -196,3 +196,6 @@ Cargo.lock
 
 *.node
 test_data
+
+*.idx
+*.seg

@@ -5,3 +5,4 @@ pub mod schema;
 pub mod segments;
 pub mod traits;
 pub mod wal;
+pub mod __test__;
