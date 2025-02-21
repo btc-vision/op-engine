@@ -418,7 +418,7 @@ mod performance_tests {
     use std::time::Instant;
 
     #[test]
-    #[ignore]
+    //#[ignore]
     fn test_insert_1_million_utxos_random_addresses() -> OpNetResult<()> {
         let test_name = "perf_1m_utxos_random";
         let db = make_test_db(test_name, 0)?;

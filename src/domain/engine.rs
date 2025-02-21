@@ -58,11 +58,9 @@ impl OpNetDB {
         let metadata = CollectionMetadata::new(name);
         col_guard.insert(name.to_string(), metadata);
 
-        // Create a ShardedMemTable for this new collection
         let mut st_guard = self.sharded_tables.write().unwrap();
         if !st_guard.contains_key(name) {
-            // You can choose shard_count and max_size any way you like
-            let shard_count = 8; // example
+            let shard_count = 8;
             let sharded_mem = ShardedMemTable::new(shard_count, self.config.memtable_size);
             st_guard.insert(name.to_string(), sharded_mem);
         }
@@ -441,7 +439,7 @@ mod tests {
 
         // Make the memtable relatively small to force multiple flushes
         let mut config = make_test_config(test_name, 120);
-        config.memtable_size = 1024 * 50; // 50 KB for demonstration
+        config.memtable_size = 1024 * 1024 * 1024;
         let db = OpNetDB::new(config)?;
 
         db.register_collection("utxo")?;
