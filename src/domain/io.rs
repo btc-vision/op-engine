@@ -23,7 +23,7 @@ impl<W: Write> ByteWriter<W> {
     }
 
     /// Write raw bytes, updating the position. Private helper for all typed methods.
-    fn write_all_bytes(&mut self, data: &[u8]) -> OpNetResult<()> {
+    pub fn write_all_bytes(&mut self, data: &[u8]) -> OpNetResult<()> {
         self.inner.write_all(data)?;
         self.position += data.len() as u64;
         Ok(())

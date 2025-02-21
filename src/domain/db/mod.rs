@@ -5,4 +5,3 @@ pub mod schema;
 pub mod segments;
 pub mod sharded_memtable;
 pub mod traits;
-pub mod wal;

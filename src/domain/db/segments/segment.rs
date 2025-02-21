@@ -24,11 +24,8 @@ pub struct SegmentManager {
     /// Sorted list of known segments, typically ascending by start_height
     pub segments: Vec<SegmentMetadata>,
 
-    /// For parallel I/O or parallel index loading, store a handle to the same thread pool the DB uses
+    /// For parallel I/O or parallel index loading, store a handle to the same thread pool that the DB uses
     thread_pool: Arc<Mutex<ThreadPool>>,
-
-    /// A simple lock that ensures only one flush at a time (avoids interleaving writes)
-    flush_lock: Mutex<()>,
 }
 
 impl SegmentManager {
@@ -45,16 +42,13 @@ impl SegmentManager {
             data_dir,
             segments: vec![],
             thread_pool,
-            flush_lock: Mutex::new(()),
         };
 
         manager.discover_existing_segments()?;
         Ok(manager)
     }
 
-    /// ------------------------------------------------------------------
-    ///  Discover and load existing segments (.seg + .idx)
-    /// ------------------------------------------------------------------
+    /// Scan directory for .seg files, parse (start_height, end_height), load .idx in parallel.
     fn discover_existing_segments(&mut self) -> OpNetResult<()> {
         let entries = std::fs::read_dir(&self.data_dir)
             .map_err(|e| OpNetError::new(&format!("discover_segments: {}", e)))?;
@@ -65,11 +59,9 @@ impl SegmentManager {
             let path = entry.path();
             if path.extension().map(|ext| ext == "seg").unwrap_or(false) {
                 if let Some(fname) = path.file_name().and_then(|x| x.to_str()) {
-                    // Expect something like "collection_10_15.seg" or "collection_10_15_2.seg"
                     let parts: Vec<&str> = fname.split('.').collect();
                     if let Some(name_and_heights) = parts.get(0) {
                         let seg_parts: Vec<&str> = name_and_heights.split('_').collect();
-                        // We need at least 3 parts: [collName, start, end] ignoring trailing suffix
                         if seg_parts.len() >= 3 {
                             if let (Ok(start), Ok(end)) =
                                 (seg_parts[1].parse::<u64>(), seg_parts[2].parse::<u64>())
@@ -87,9 +79,6 @@ impl SegmentManager {
             }
         }
 
-        // ------------------------------------------------------------------
-        //  Load indexes in parallel using the thread pool
-        // ------------------------------------------------------------------
         let mut join_handles = vec![];
         {
             let pool = self.thread_pool.lock().map_err(|_| {
@@ -98,14 +87,12 @@ impl SegmentManager {
 
             for mut seg_meta in discovered {
                 let idx_path = seg_meta.file_path.with_extension("idx");
-                // Create a task that loads the BTreeIndex (if present) from disk.
+                // We'll load the BTreeIndex in a parallel task
                 let handle = pool.execute(move || {
                     if let Ok(file) = std::fs::File::open(&idx_path) {
                         let mut br = std::io::BufReader::new(file);
                         if let Ok(btree) = BTreeIndex::read_from_disk(&mut br) {
                             seg_meta.index = Some(Arc::new(btree));
-                        } else {
-                            seg_meta.index = None;
                         }
                     }
                     seg_meta
@@ -114,7 +101,7 @@ impl SegmentManager {
             }
         }
 
-        // Collect the results
+        // Collect results
         for handle in join_handles {
             let seg_meta = handle.join().map_err(|_| {
                 OpNetError::new("Thread pool worker panicked while loading segment index.")
@@ -122,27 +109,18 @@ impl SegmentManager {
             self.segments.push(seg_meta);
         }
 
-        // Sort segments by start_height
+        // Sort by start_height
         self.segments.sort_by_key(|s| s.start_height);
-
         Ok(())
     }
 
-    /// Similar to `flush_memtable_to_segment` but iterates over each shard in a `ShardedMemTable`.
-    /// Acquires the `flush_lock` so multiple flushes won't interfere.
-    /// **Note**: This method does NOT clear the sharded memtable; you can do that after success.
+    /// Optimized flush for NVMe: no global lock, large buffer, single big writes per shard.
     pub fn flush_sharded_memtable_to_segment(
         &mut self,
         collection_name: &str,
         sharded_mem: &ShardedMemTable,
         flush_block_height: u64,
     ) -> OpNetResult<()> {
-        let _guard = self
-            .flush_lock
-            .lock()
-            .map_err(|_| OpNetError::new("Failed to lock flush_lock"))?;
-
-        // If total size is zero, nothing to flush
         if sharded_mem.total_size() == 0 {
             return Ok(());
         }
@@ -150,7 +128,7 @@ impl SegmentManager {
         let start_height = flush_block_height;
         let end_height = flush_block_height;
 
-        // Build a unique base filename
+        // Build base seg filename
         let base_seg_filename = format!("{}_{}_{}", collection_name, start_height, end_height);
         let mut seg_file_name = format!("{}.seg", base_seg_filename);
         let mut idx_file_name = format!("{}.idx", base_seg_filename);
@@ -158,7 +136,7 @@ impl SegmentManager {
         let mut seg_path = self.data_dir.join(&seg_file_name);
         let mut idx_path = self.data_dir.join(&idx_file_name);
 
-        // Ensure unique files if they already exist
+        // If those files exist, keep appending numeric suffix
         let mut attempt = 2;
         while seg_path.exists() || idx_path.exists() {
             seg_file_name = format!("{}_{}", base_seg_filename, attempt);
@@ -171,7 +149,7 @@ impl SegmentManager {
             attempt += 1;
         }
 
-        // Create & write .seg
+        // Open .seg with a large buffer
         let seg_file = OpenOptions::new()
             .create(true)
             .write(true)
@@ -184,25 +162,56 @@ impl SegmentManager {
                 ))
             })?;
 
-        let mut seg_writer = ByteWriter::new(BufWriter::new(seg_file));
+        let buf_capacity = 32 * 1024 * 1024; // 32 MB
+        let mut seg_writer = ByteWriter::new(BufWriter::with_capacity(buf_capacity, seg_file));
+
         let mut btree = BTreeIndex::new();
 
-        // ------------------------------------------------------------------
-        //  For each shard, lock it, iterate over (k,v) pairs, write them out
-        // ------------------------------------------------------------------
+        // We'll chunk each shard’s data to avoid insane allocations
+        let max_chunk_size = 128 * 1024 * 1024;
+
+        // helper function to flush a chunk
+        let mut flush_chunk =
+            |writer: &mut ByteWriter<_>, buffer: &mut Vec<u8>| -> OpNetResult<()> {
+                if !buffer.is_empty() {
+                    writer.write_all_bytes(buffer)?;
+                    buffer.clear();
+                }
+                Ok(())
+            };
+
         for shard_mutex in &sharded_mem.shards {
             let shard = shard_mutex.lock().unwrap();
-            for (k, v) in shard.data.iter() {
-                let offset = seg_writer.position();
-                seg_writer.write_var_bytes(k)?; // key
-                seg_writer.write_var_bytes(v)?; // value
-                btree.insert(k.clone(), offset);
+            let shard_claimed_size = shard.size();
+
+            if shard_claimed_size == 0 {
+                continue;
             }
+
+            // clamp to avoid insane allocations if shard.size() is corrupted
+            let initial_capacity = std::cmp::min(shard_claimed_size, max_chunk_size);
+            let mut shard_data = Vec::with_capacity(initial_capacity);
+
+            for (k, v) in shard.data.iter() {
+                let offset = seg_writer.position() + shard_data.len() as u64;
+                btree.insert(k.clone(), offset);
+
+                encode_fixed_bytes(&mut shard_data, k);
+                encode_fixed_bytes(&mut shard_data, v);
+
+                // if we exceed chunk limit, flush now
+                if shard_data.len() >= max_chunk_size {
+                    flush_chunk(&mut seg_writer, &mut shard_data)?;
+                }
+            }
+
+            // flush remaining
+            flush_chunk(&mut seg_writer, &mut shard_data)?;
         }
 
         seg_writer.flush()?;
 
-        // Create the .idx file
+        // Write the B-Tree to .idx
         let idx_file = OpenOptions::new()
             .create(true)
             .write(true)
@@ -215,11 +224,11 @@ impl SegmentManager {
                 ))
             })?;
 
-        let mut bw = BufWriter::new(idx_file);
+        let mut bw = BufWriter::with_capacity(buf_capacity, idx_file);
         btree.write_to_disk(&mut bw)?;
         bw.flush()?;
 
-        // Create a new segment metadata entry
+        // Add a new segment metadata
         let meta = SegmentMetadata {
             file_path: seg_path,
             start_height,
@@ -232,27 +241,52 @@ impl SegmentManager {
         Ok(())
     }
 
-    // ------------------------------------------------------------------
-    //  Querying & reading from segments
-    // ------------------------------------------------------------------
+    /// Reads a record (K,V) from a .seg file at the given offset, verifying that the stored key == search_key.
+    pub fn read_record_from_segment(
+        &self,
+        seg_path: &Path,
+        offset: u64,
+        search_key: &[u8],
+    ) -> OpNetResult<Option<Vec<u8>>> {
+        let mut file = std::fs::File::open(seg_path)
+            .map_err(|e| OpNetError::new(&format!("read_record open: {}", e)))?;
 
-    /// Search from newest to oldest segment for a key. If found in a B-tree index, read from `.seg`.
+        file.seek(SeekFrom::Start(offset))
+            .map_err(|e| OpNetError::new(&format!("seek: {}", e)))?;
+
+        let mut br = ByteReader::new(&mut file);
+
+        let stored_key = match br.read_var_bytes() {
+            Ok(k) => k,
+            Err(_) => return Ok(None),
+        };
+
+        if stored_key != search_key {
+            return Ok(None);
+        }
+
+        let val = match br.read_var_bytes() {
+            Ok(v) => v,
+            Err(_) => return Ok(None),
+        };
+        Ok(Some(val))
+    }
+
+    /// Search from newest to oldest for a key in segments
     pub fn find_value_for_key(
         &self,
         collection_name: &str,
         key: &[u8],
     ) -> OpNetResult<Option<Vec<u8>>> {
-        // Check from newest to oldest
         for seg in self.segments.iter().rev() {
-            // Quick check if the segment belongs to this collection by file prefix
             if let Some(fname) = seg.file_path.file_name().and_then(|x| x.to_str()) {
                 if !fname.starts_with(collection_name) {
                     continue;
                 }
             }
+
             if let Some(ref btree) = seg.index {
                 if let Some(offset) = btree.get(key) {
-                    // Attempt reading from .seg
                     let val = self.read_record_from_segment(&seg.file_path, offset, key)?;
                     if val.is_some() {
                         return Ok(val);
@@ -263,8 +297,7 @@ impl SegmentManager {
         Ok(None)
     }
 
-    /// Return up to `limit` values for keys in [start_key, end_key] by scanning from newest to oldest,
-    /// skipping duplicates.
+    /// Return up to `limit` values in [start_key, end_key], scanning from newest to oldest, deduplicating.
     pub fn find_values_in_range(
         &self,
         collection_name: &str,
@@ -276,16 +309,13 @@ impl SegmentManager {
         let mut results = Vec::new();
         let mut seen_keys = HashSet::new();
 
-        // Again, newest to oldest
         for seg in self.segments.iter().rev() {
             if let Some(fname) = seg.file_path.file_name().and_then(|x| x.to_str()) {
                 if !fname.starts_with(collection_name) {
                     continue;
                 }
             }
-
             if let Some(ref btree) = seg.index {
-                // Range search in the B-tree index
                 let items = btree.range_search(start_key, end_key, Some(limit - results.len()));
                 for (k, offset) in items {
                     if seen_keys.contains(&k) {
@@ -304,49 +334,11 @@ impl SegmentManager {
                 }
             }
         }
-
         Ok(results)
     }
 
-    /// Reads a record (K,V) from a `.seg` file at the given `offset`, verifying that the stored key == `search_key`.
-    pub fn read_record_from_segment(
-        &self,
-        seg_path: &Path,
-        offset: u64,
-        search_key: &[u8],
-    ) -> OpNetResult<Option<Vec<u8>>> {
-        let mut file = std::fs::File::open(seg_path)
-            .map_err(|e| OpNetError::new(&format!("read_record open: {}", e)))?;
-        file.seek(SeekFrom::Start(offset))
-            .map_err(|e| OpNetError::new(&format!("seek: {}", e)))?;
-
-        let mut br = ByteReader::new(&mut file);
-        let stored_key = match br.read_var_bytes() {
-            Ok(k) => k,
-            Err(_) => {
-                // offset out-of-bounds or corrupted => return None
-                return Ok(None);
-            }
-        };
-
-        if stored_key != search_key {
-            // Key mismatch => not our record
-            return Ok(None);
-        }
-
-        let val = match br.read_var_bytes() {
-            Ok(v) => v,
-            Err(_) => return Ok(None),
-        };
-        Ok(Some(val))
-    }
-
-    // ------------------------------------------------------------------
-    //  Rollback logic
-    // ------------------------------------------------------------------
-    /// Remove any segments whose `end_height` is above `height`, also deleting their files from disk.
+    /// Remove segments above `height` and delete their files
     pub fn rollback_to_height(&mut self, height: u64) -> OpNetResult<()> {
-        // Identify which segments to remove
         let to_remove: Vec<usize> = self
             .segments
             .iter()
@@ -354,18 +346,20 @@ impl SegmentManager {
             .filter(|(_, seg)| seg.end_height > height)
             .map(|(idx, _)| idx)
             .collect();
-
-        // Remove them in reverse order so we don't mess up indexes
         for idx in to_remove.into_iter().rev() {
             let seg = self.segments.remove(idx);
-            // Attempt to delete seg file and idx file
             let _ = std::fs::remove_file(&seg.file_path);
             let idx_path = seg.file_path.with_extension("idx");
             let _ = std::fs::remove_file(idx_path);
         }
-
         Ok(())
     }
+}
+
+fn encode_fixed_bytes(buf: &mut Vec<u8>, data: &[u8]) {
+    let len_le = (data.len() as u64).to_le_bytes();
+    buf.extend_from_slice(&len_le);
+    buf.extend_from_slice(data);
 }
 
 #[cfg(test)]
@@ -863,7 +857,6 @@ mod tests {
 
     #[test]
     fn test_discover_valid_index_file() {
-        // 1) Create a SegmentManager and flush a ShardedMemTable to produce a .seg and .idx on disk
         let (tmp_dir, mut seg_mgr) = make_segment_manager();
 
         // Write out a sharded memtable with a single key-value pair

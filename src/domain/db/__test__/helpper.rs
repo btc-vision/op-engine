@@ -11,8 +11,8 @@ pub fn make_test_config(test_name: &str, start_height: u64) -> DbConfig {
     DbConfig {
         data_path,
         wal_path,
-        num_threads: 4,
-        memtable_size: 1024 * 1024,
+        num_threads: 8,
+        memtable_size: 1024 * 1024 * 1024,
         height: start_height,
     }
 }

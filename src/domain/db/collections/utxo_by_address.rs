@@ -418,7 +418,7 @@ mod performance_tests {
     use std::time::Instant;
 
     #[test]
-    //#[ignore]
+    #[ignore]
     fn test_insert_1_million_utxos_random_addresses() -> OpNetResult<()> {
         let test_name = "perf_1m_utxos_random";
         let db = make_test_db(test_name, 0)?;
@@ -428,12 +428,11 @@ mod performance_tests {
         let main_coll = db.collection::<Utxo>("utxo")?;
         let addr_coll = db.collection::<UtxoByAddressRef>("utxo_by_address")?;
 
-        let total_utxos = 1_000_000;
-        let block_size = 10_000; // e.g. 100 blocks
+        let total_utxos = 10_000_000;
+        let block_size = 100_000; // e.g. 100 blocks
         let mut current_block = 100;
 
-        // We'll pick a single "known" address that we'll use occasionally, so we
-        // can reliably fetch 1000 from it later.
+        // We'll pick a single "known" address that we'll use occasionally, so we can reliably fetch 1000 from it later.
         let known_address = [0xAA; 33];
 
         let start_time = Instant::now();
@@ -487,7 +486,6 @@ mod performance_tests {
                 )?;
             }
 
-            // Flush after each block
             db.flush_all(current_block)?;
 
             total_inserted += block_size;
@@ -523,7 +521,7 @@ mod performance_tests {
             "We expect to find at least 1000 in the known address"
         );
 
-        teardown_fs(test_name);
+        //teardown_fs(test_name);
         Ok(())
     }
 

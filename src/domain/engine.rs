@@ -2,7 +2,6 @@ use crate::domain::blockchain::reorg::ReorgManager;
 use crate::domain::db::collection::{Collection, CollectionMetadata};
 use crate::domain::db::segments::segment::SegmentManager;
 use crate::domain::db::traits::key_provider::KeyProvider;
-use crate::domain::db::wal::WAL;
 use crate::domain::generic::config::DbConfig;
 use crate::domain::generic::errors::{OpNetError, OpNetResult};
 use crate::domain::thread::concurrency::ThreadPool;
@@ -14,7 +13,6 @@ use std::sync::{Arc, Mutex, RwLock};
 pub struct OpNetDB {
     pub config: DbConfig,
     pub thread_pool: Arc<Mutex<ThreadPool>>,
-    pub wal: Arc<Mutex<WAL>>,
     pub sharded_tables: Arc<RwLock<HashMap<String, ShardedMemTable>>>,
     pub segment_manager: Arc<Mutex<SegmentManager>>,
     pub reorg_manager: Arc<Mutex<ReorgManager>>,
@@ -23,7 +21,6 @@ pub struct OpNetDB {
 
 impl OpNetDB {
     pub fn new(config: DbConfig) -> OpNetResult<Self> {
-        let wal = WAL::open(&config.wal_path)?;
         let thread_pool = Arc::new(Mutex::new(ThreadPool::new(config.num_threads)));
 
         // Create an empty map of collection_name -> ShardedMemTable
@@ -42,7 +39,6 @@ impl OpNetDB {
         Ok(OpNetDB {
             config,
             thread_pool,
-            wal: Arc::new(Mutex::new(wal)),
             sharded_tables,
             segment_manager,
             reorg_manager,
@@ -92,7 +88,6 @@ impl OpNetDB {
         Ok(Collection::new(
             name.to_string(),
             Arc::clone(&self.sharded_tables),
-            Arc::clone(&self.wal),
             Arc::clone(&self.segment_manager),
             Arc::clone(&self.reorg_manager),
             metadata,
@@ -112,9 +107,6 @@ impl OpNetDB {
             }
         }
 
-        // WAL checkpoint
-        let mut wal_guard = self.wal.lock().unwrap();
-        wal_guard.checkpoint()?;
         Ok(())
     }
 

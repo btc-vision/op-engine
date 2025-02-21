@@ -3,7 +3,6 @@ use crate::domain::blockchain::reorg::ReorgManager;
 use crate::domain::db::segments::segment::SegmentManager;
 use crate::domain::db::sharded_memtable::ShardedMemTable;
 use crate::domain::db::traits::key_provider::KeyProvider;
-use crate::domain::db::wal::WAL;
 use crate::domain::generic::errors::{OpNetError, OpNetResult};
 use crate::domain::io::{ByteReader, ByteWriter, CustomSerialize};
 use std::collections::HashMap;
@@ -27,7 +26,6 @@ where
     pub(crate) name: String,
     /// Instead of a single MemTable per collection, we now have a ShardedMemTable.
     pub(crate) sharded_tables: Arc<RwLock<HashMap<String, ShardedMemTable>>>,
-    pub(crate) wal: Arc<Mutex<WAL>>,
     pub(crate) segment_manager: Arc<Mutex<SegmentManager>>,
     pub(crate) reorg_manager: Arc<Mutex<ReorgManager>>,
     pub(crate) metadata: CollectionMetadata,
@@ -43,7 +41,6 @@ where
     pub fn new(
         name: String,
         sharded_tables: Arc<RwLock<HashMap<String, ShardedMemTable>>>,
-        wal: Arc<Mutex<WAL>>,
         segment_manager: Arc<Mutex<SegmentManager>>,
         reorg_manager: Arc<Mutex<ReorgManager>>,
         metadata: CollectionMetadata,
@@ -51,7 +48,6 @@ where
         Collection {
             name,
             sharded_tables,
-            wal,
             segment_manager,
             reorg_manager,
             metadata,
@@ -67,13 +63,8 @@ where
             let mut writer = ByteWriter::new(&mut buffer);
             record.serialize(&mut writer)?;
         }
-        let key = record.primary_key();
 
-        // 2) Append to WAL (so we can recover in case of crash)
-        {
-            let mut wal_guard = self.wal.lock().unwrap();
-            wal_guard.append(&buffer)?;
-        }
+        let key = record.primary_key();
 
         // 3) Insert into the correct shard
         {
@@ -133,7 +124,6 @@ mod tests {
     use super::*;
     use crate::domain::blockchain::reorg::ReorgManager;
     use crate::domain::db::segments::segment::SegmentManager;
-    use crate::domain::db::wal::WAL;
     use crate::domain::generic::errors::OpNetResult;
     use crate::domain::io::{ByteReader, ByteWriter, CustomSerialize};
     use crate::domain::thread::concurrency::ThreadPool;
@@ -202,11 +192,6 @@ mod tests {
         map.insert(collection_name.to_string(), sharded_mem);
         let sharded_tables_arc = Arc::new(RwLock::new(map));
 
-        // Create a WAL
-        let wal_path = tmp_dir.path().join("test_wal.log");
-        let wal = WAL::open(wal_path).expect("WAL open must succeed");
-        let wal_arc = Arc::new(Mutex::new(wal));
-
         // Create a ReorgManager
         let reorg = ReorgManager::new();
         let reorg_arc = Arc::new(Mutex::new(reorg));
@@ -216,7 +201,6 @@ mod tests {
         let collection = Collection::<MockRecord>::new(
             collection_name.to_string(),
             sharded_tables_arc,
-            wal_arc,
             seg_manager_arc,
             reorg_arc,
             metadata,
