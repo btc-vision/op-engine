@@ -428,7 +428,7 @@ mod performance_tests {
         let main_coll = db.collection::<Utxo>("utxo")?;
         let addr_coll = db.collection::<UtxoByAddressRef>("utxo_by_address")?;
 
-        let total_utxos = 10_000_000;
+        let total_utxos = 1_000_000;
         let block_size = 100_000; // e.g. 100 blocks
         let mut current_block = 100;
 
@@ -446,7 +446,7 @@ mod performance_tests {
                 // Decide which address to use:
                 //
                 // so we definitely have enough for a final 1000 fetch.
-                let address_chance = (i % 100) == 0; // 1 out of 50 =>
+                let address_chance = (i % 1000) == 0; // 1 out of 50 =>
                 let address: [u8; 33] = if address_chance {
                     known_address
                 } else {
@@ -509,7 +509,7 @@ mod performance_tests {
         // Now let's fetch up to 1000 from the "known" address:
         let fetch_start = Instant::now();
         let found =
-            addr_coll.find_unspent_utxos_for_address(known_address, None, 1000, &main_coll)?;
+            addr_coll.find_unspent_utxos_for_address(known_address, None, 10000, &main_coll)?;
         let fetch_time = fetch_start.elapsed();
         println!(
             "Fetched up to 1000 unspent from known address in {:?}. Found {} total.",

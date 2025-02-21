@@ -6,6 +6,8 @@ use crate::domain::generic::config::DbConfig;
 use crate::domain::generic::errors::{OpNetError, OpNetResult};
 use crate::domain::thread::concurrency::ThreadPool;
 
+use crate::domain::db::__test__::helpper::{make_test_config, setup_fs, teardown_fs};
+use crate::domain::db::collections::utxo::Utxo;
 use crate::domain::db::sharded_memtable::ShardedMemTable;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
@@ -130,6 +132,40 @@ impl OpNetDB {
 
 pub fn main() -> () {
     env_logger::init();
+
+    /*let test_name = "full_flow";
+    setup_fs(test_name).unwrap();
+
+    let config = make_test_config(test_name, 100);
+    let db = OpNetDB::new(config).unwrap();
+
+    db.register_collection("utxo").unwrap();
+    let utxo_coll = db.collection::<Utxo>("utxo").unwrap();
+
+    let sample = Utxo {
+        tx_id: [0xab; 32],
+        output_index: 0,
+        address: [0xcd; 33],
+        amount: 10_000,
+        script_pubkey: vec![0xAA, 0xBB, 0xCC],
+        deleted_at_block: None,
+    };
+
+    // Insert at block 101
+    utxo_coll.insert(sample.clone(), 101).unwrap();
+    let found = utxo_coll.get(&([0xab; 32], 0)).unwrap();
+    assert!(found.is_some());
+    assert_eq!(found.as_ref().unwrap().amount, 10_000);
+
+    // Flush
+    db.flush_all(101).unwrap();
+
+    // Confirm data is still there after flush
+    let found2 = utxo_coll.get(&([0xab; 32], 0)).unwrap();
+    assert!(found2.is_some());
+    assert_eq!(found2.as_ref().unwrap().amount, 10_000);
+
+    teardown_fs(test_name);*/
 }
 
 #[cfg(test)]
