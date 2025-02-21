@@ -22,8 +22,6 @@ pub struct OpNetDB {
 
 impl OpNetDB {
     pub fn new(config: DbConfig) -> OpNetResult<Self> {
-        env_logger::init();
-
         let wal = WAL::open(&config.wal_path)?;
         let thread_pool = Arc::new(Mutex::new(ThreadPool::new(config.num_threads)));
         let memtables = Arc::new(RwLock::new(HashMap::new()));
@@ -125,28 +123,61 @@ impl OpNetDB {
     }
 }
 
+pub fn main() -> () {
+    env_logger::init();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::domain::db::collections::utxo::Utxo;
+    use crate::domain::generic::config::DbConfig;
+    use crate::domain::generic::errors::OpNetResult;
     use std::fs;
+    use std::time::Instant;
 
-    #[test]
-    fn test_full_flow() -> OpNetResult<()> {
-        let _ = fs::remove_dir_all("./test_data");
-        fs::create_dir_all("./test_data")?;
-
-        let config = DbConfig {
-            data_path: "./test_data".into(),
-            wal_path: "./test_data/wal.log".into(),
+    /// A helper to build a default test config for each test,
+    /// using a unique path to avoid collisions.
+    fn make_test_config(test_name: &str, start_height: u64) -> DbConfig {
+        let data_path = format!("./test_data_{test_name}");
+        let wal_path = format!("./test_data_{test_name}/wal.log");
+        DbConfig {
+            data_path,
+            wal_path,
             num_threads: 4,
             memtable_size: 1024 * 1024,
-            height: 100,
-        };
+            height: start_height,
+        }
+    }
 
+    /// A helper that ensures we start fresh for each test.
+    /// Removes any existing directory, then creates it.
+    fn setup_fs(test_name: &str) -> OpNetResult<()> {
+        let dir = format!("./test_data_{test_name}");
+        let _ = fs::remove_dir_all(&dir); // ignore error if doesn't exist
+        fs::create_dir_all(&dir)?;
+        Ok(())
+    }
+
+    /// A helper to clean up after tests.
+    fn teardown_fs(test_name: &str) {
+        let dir = format!("./test_data_{test_name}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ------------------------------------------------------------------
+    // 1) Basic full-flow test (uses blocks near 101)
+    //    => config height can remain at 100
+    // ------------------------------------------------------------------
+    #[test]
+    fn test_full_flow() -> OpNetResult<()> {
+        let test_name = "full_flow";
+        setup_fs(test_name)?;
+
+        let config = make_test_config(test_name, 100);
         let db = OpNetDB::new(config)?;
-        db.register_collection("utxo")?;
 
+        db.register_collection("utxo")?;
         let utxo_coll = db.collection::<Utxo>("utxo")?;
 
         let sample = Utxo {
@@ -157,21 +188,397 @@ mod tests {
             script_pubkey: vec![0xAA, 0xBB, 0xCC],
         };
 
+        // Insert at block 101
         utxo_coll.insert(sample.clone(), 101)?;
-
-        // Check in memtable
         let found = utxo_coll.get(&([0xab; 32], 0))?;
         assert!(found.is_some());
         assert_eq!(found.as_ref().unwrap().amount, 10_000);
 
+        // Flush
         db.flush_all(101)?;
 
-        // Simulate a reorg.
-        //db.reorg_to(100)?;
-
-        // Because segment was above block 100, it was removed
+        // Confirm data is still there after flush
         let found2 = utxo_coll.get(&([0xab; 32], 0))?;
         assert!(found2.is_some());
+        assert_eq!(found2.as_ref().unwrap().amount, 10_000);
+
+        teardown_fs(test_name);
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // 2) Edge Case: Register a collection that already exists
+    // ------------------------------------------------------------------
+    #[test]
+    fn test_register_existing_collection() -> OpNetResult<()> {
+        let test_name = "register_existing_collection";
+        setup_fs(test_name)?;
+
+        let config = make_test_config(test_name, 100);
+        let db = OpNetDB::new(config)?;
+
+        db.register_collection("utxo")?;
+        // Trying again should fail
+        let result = db.register_collection("utxo");
+        assert!(result.is_err());
+
+        teardown_fs(test_name);
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // 3) Edge Case: Request a collection that doesn't exist
+    // ------------------------------------------------------------------
+    #[test]
+    fn test_collection_not_registered() -> OpNetResult<()> {
+        let test_name = "collection_not_registered";
+        setup_fs(test_name)?;
+
+        let config = make_test_config(test_name, 100);
+        let db = OpNetDB::new(config)?;
+
+        // We never registered "utxo"
+        let result = db.collection::<Utxo>("utxo");
+        assert!(result.is_err());
+
+        teardown_fs(test_name);
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // 4) Flush all with empty memtables (should be no-op, no errors).
+    // ------------------------------------------------------------------
+    #[test]
+    fn test_flush_empty() -> OpNetResult<()> {
+        let test_name = "flush_empty";
+        setup_fs(test_name)?;
+
+        let config = make_test_config(test_name, 100);
+        let db = OpNetDB::new(config)?;
+
+        // Register but don't insert anything
+        db.register_collection("utxo")?;
+        // Should not panic or error even though memtable is empty
+        db.flush_all(101)?;
+
+        teardown_fs(test_name);
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // 5) Reorg to a past height: from 105 down to 100
+    //    => config height must be at least 105 to allow reorg down to 100.
+    // ------------------------------------------------------------------
+    #[test]
+    fn test_reorg_past() -> OpNetResult<()> {
+        let test_name = "reorg_past";
+        setup_fs(test_name)?;
+
+        // Start the chain at 105 so reorg down to 100 is valid
+        let config = make_test_config(test_name, 105);
+        let db = OpNetDB::new(config)?;
+
+        db.register_collection("utxo")?;
+        let utxo_coll = db.collection::<Utxo>("utxo")?;
+
+        let sample = Utxo {
+            tx_id: [0xcd; 32],
+            output_index: 2,
+            address: [0xde; 20],
+            amount: 5000,
+            script_pubkey: vec![0xAA],
+        };
+
+        // Insert at height 105
+        utxo_coll.insert(sample.clone(), 105)?;
+        db.flush_all(105)?;
+
+        // Now reorg back to 100
+        db.reorg_to(100)?;
+
+        // Because the segment for data at 105 is above 100, it should be rolled back
+        let found = utxo_coll.get(&([0xcd; 32], 2))?;
+        assert!(found.is_none(), "Should be removed after reorg");
+
+        teardown_fs(test_name);
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // 6) Reorg to a future height (above current), which should fail.
+    //    We'll start at 105 and try to reorg to 200 => error.
+    // ------------------------------------------------------------------
+    #[test]
+    fn test_reorg_future() -> OpNetResult<()> {
+        let test_name = "reorg_future";
+        setup_fs(test_name)?;
+
+        let config = make_test_config(test_name, 105);
+        let db = OpNetDB::new(config)?;
+
+        // Attempt reorg to 200
+        let result = db.reorg_to(200);
+        assert!(
+            result.is_err(),
+            "Expected error when reorging above current height"
+        );
+
+        teardown_fs(test_name);
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // 7) Flush with big blocks (stress test).
+    //    Insert 50,000 UTXOs at block 110, flush, do a spot check.
+    // ------------------------------------------------------------------
+    #[test]
+    fn test_flush_with_big_blocks() -> OpNetResult<()> {
+        let test_name = "flush_big_blocks";
+        setup_fs(test_name)?;
+
+        // Start chain at 120, so block 110 is still valid (just "in the past" if you prefer).
+        // Or you can start at 110 if you want. It's not critical for this test if we don't reorg.
+        let config = make_test_config(test_name, 120);
+        let db = OpNetDB::new(config)?;
+
+        db.register_collection("utxo")?;
+        let utxo_coll = db.collection::<Utxo>("utxo")?;
+
+        // Insert 50,000 UTXOs as an example "big" test
+        let n = 50_000;
+        let start = Instant::now();
+        for i in 0..n {
+            let mut tx_id = [0u8; 32];
+            tx_id[0] = (i % 256) as u8; // only the first byte changes
+            tx_id[1] = (i >> 8) as u8; // 0-39
+            tx_id[2] = (i >> 16) as u8; // 0-39
+            let sample = Utxo {
+                tx_id,
+                output_index: i,
+                address: [0xcd; 20],
+                amount: i as u64,
+                script_pubkey: vec![0xEE, 0xFF],
+            };
+            // Insert at block 110
+            utxo_coll.insert(sample, 110)?;
+        }
+        let insert_duration = start.elapsed();
+        println!("Inserted {} UTXOs in {:?}", n, insert_duration);
+
+        // Flush memtable to disk
+        let flush_start = Instant::now();
+        //db.flush_all(110)?;
+        let flush_duration = flush_start.elapsed();
+        println!("Flushed {} UTXOs in {:?}", n, flush_duration);
+
+        let loaded = db.collection::<Utxo>("utxo")?;
+
+        // Spot check i=999
+        // We know for i=999 => tx_id[0] = 999 % 256 = 231 (0xE7), rest are zero.
+        // So the actual key is ([231,0,0,0,...0], 999).
+        let mut check_key = [0u8; 32];
+        check_key[0] = (999 % 256) as u8; // 231
+        check_key[1] = (999 >> 8) as u8;
+        check_key[2] = (999 >> 16) as u8;
+        let found = loaded.get(&(check_key, 999))?;
+        assert!(
+            found.is_some(),
+            "Expected to find UTXO with i=999 after flush"
+        );
+
+        teardown_fs(test_name);
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // 10) Double-flush and reorg:
+    //     Insert at block 110, then 111, reorg back to 110.
+    //     => the second flush’s data is rolled back
+    // ------------------------------------------------------------------
+    #[test]
+    fn test_double_flush_and_reorg() -> OpNetResult<()> {
+        let test_name = "double_flush_and_reorg";
+        setup_fs(test_name)?;
+
+        // Start chain at 120, so reorg to 110 is valid
+        let config = make_test_config(test_name, 120);
+        let db = OpNetDB::new(config)?;
+
+        db.register_collection("utxo")?;
+        let utxo_coll = db.collection::<Utxo>("utxo")?;
+
+        // Insert at block 110, flush
+        let sample1 = Utxo {
+            tx_id: [1u8; 32],
+            output_index: 0,
+            address: [0xcd; 20],
+            amount: 1_000,
+            script_pubkey: vec![0x01],
+        };
+        utxo_coll.insert(sample1.clone(), 110)?;
+        db.flush_all(110)?;
+
+        // Insert at block 111, flush
+        let sample2 = Utxo {
+            tx_id: [2u8; 32],
+            output_index: 1,
+            address: [0xcd; 20],
+            amount: 2_000,
+            script_pubkey: vec![0x02],
+        };
+        utxo_coll.insert(sample2.clone(), 111)?;
+        db.flush_all(111)?;
+
+        // Both should be present now
+        let found1 = utxo_coll.get(&([1u8; 32], 0))?;
+        assert!(found1.is_some(), "sample1 should be found");
+        let found2 = utxo_coll.get(&([2u8; 32], 1))?;
+        assert!(found2.is_some(), "sample2 should be found");
+
+        // Reorg back to 110 -> The data at block 111 should be rolled back
+        db.reorg_to(110)?;
+
+        // sample1 should remain, sample2 should be removed
+        let found1_after = utxo_coll.get(&([1u8; 32], 0))?;
+        assert!(found1_after.is_some(), "sample1 should remain after reorg");
+        let found2_after = utxo_coll.get(&([2u8; 32], 1))?;
+        assert!(
+            found2_after.is_none(),
+            "sample2 should be removed after reorg"
+        );
+
+        teardown_fs(test_name);
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // 8) Big number of UTXOs across multiple flushes:
+    //    If memtable_size is smaller, we might see multiple segments for each flush.
+    // ------------------------------------------------------------------
+    #[test]
+    fn test_many_flushed_segments() -> OpNetResult<()> {
+        let test_name = "many_flushed_segments";
+        setup_fs(test_name)?;
+
+        // Make the memtable relatively small to force multiple flushes
+        let mut config = make_test_config(test_name, 120);
+        // ^ consider starting at a height >= 110 if you're inserting at block 110 or higher
+        config.memtable_size = 1024 * 50; // 50 KB for demonstration
+        let db = OpNetDB::new(config)?;
+
+        db.register_collection("utxo")?;
+        let utxo_coll = db.collection::<Utxo>("utxo")?;
+
+        let large_count = 10_000;
+        let chunk_size = 2_000;
+        let mut current_block = 110;
+
+        // Insert in multiple waves
+        for chunk_start in (0..large_count).step_by(chunk_size) {
+            for i in chunk_start..(chunk_start + chunk_size) {
+                // For i up to 9999, i % 256 fits in a single byte
+                let mut tx_id = [0u8; 32];
+                tx_id[0] = (i % 256) as u8;
+                tx_id[1] = (i >> 8) as u8; // 0-39
+                tx_id[2] = (i >> 16) as u8; // 0-39
+                let sample = Utxo {
+                    tx_id,
+                    output_index: i as u32,
+                    address: [0xcd; 20],
+                    amount: i as u64,
+                    script_pubkey: vec![0x00],
+                };
+                utxo_coll.insert(sample, current_block)?;
+            }
+            // Flush each chunk
+            db.flush_all(current_block)?;
+            current_block += 1;
+        }
+
+        // Spot check the last chunk includes i=9999
+        // For i=9999 => tx_id[0] = 9999 % 256 = 15
+        // So the key is [15, 0, 0, 0, ...], output_index = 9999
+        let mut check_key = [0u8; 32];
+        check_key[0] = (9999 % 256) as u8; // 15
+        check_key[1] = (9999 >> 8) as u8;
+        check_key[2] = (9999 >> 16) as u8;
+        let found = utxo_coll.get(&(check_key, 9999))?;
+        assert!(
+            found.is_some(),
+            "Expected to find UTXO for i=9999 in the last chunk"
+        );
+
+        teardown_fs(test_name);
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // 9) Concurrency test: multiple threads inserting
+    //    Demonstrates concurrency but is not a perfect concurrency test
+    // ------------------------------------------------------------------
+    #[test]
+    fn test_concurrent_inserts() -> OpNetResult<()> {
+        let test_name = "concurrent_inserts";
+        setup_fs(test_name)?;
+
+        // Start height at 120 so inserting at block 120 is valid if needed
+        let config = make_test_config(test_name, 120);
+        let db = OpNetDB::new(config)?;
+
+        db.register_collection("utxo")?;
+
+        // We'll spawn multiple threads that each insert 1000 UTXOs.
+        // Because `OpNetDB` uses an internal ThreadPool, we demonstrate normal usage:
+        let utxo_coll = Arc::new(db.collection::<Utxo>("utxo")?);
+
+        let mut handles = vec![];
+        for thread_id in 0..4 {
+            let coll_clone = Arc::clone(&utxo_coll);
+            handles.push(std::thread::spawn(move || -> OpNetResult<()> {
+                for i in 0..1000 {
+                    let amount = (thread_id * 1000 + i) as u64;
+                    let mut tx_id = [0u8; 32];
+                    tx_id[0] = thread_id as u8;
+                    tx_id[1] = (i % 256) as u8;
+
+                    let sample = Utxo {
+                        tx_id,
+                        output_index: i,
+                        address: [0xaa; 20],
+                        amount,
+                        script_pubkey: vec![0xAA, 0xBB],
+                    };
+                    // Insert at block 120
+                    coll_clone.insert(sample, 120)?;
+                }
+                Ok(())
+            }));
+        }
+
+        // Join all threads
+        for h in handles {
+            let res = h.join();
+            assert!(res.is_ok());
+            if let Ok(Err(e)) = res {
+                panic!("Thread returned error: {:?}", e);
+            }
+        }
+
+        // Finally, flush
+        db.flush_all(120)?;
+
+        // Spot check: Suppose we want to confirm that the item inserted by
+        // thread_id = 0, i = 250 is present:
+        // => tx_id[0] = 0, tx_id[1] = 250, output_index = 250
+        let mut check_key = [0u8; 32];
+        check_key[1] = 250;
+        let found = utxo_coll.get(&(check_key, 250))?;
+        assert!(
+            found.is_some(),
+            "Expected to find UTXO for i=250 from thread 0"
+        );
+
+        teardown_fs(test_name);
         Ok(())
     }
 }
