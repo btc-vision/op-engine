@@ -49,8 +49,8 @@ operations. This database is optimized around **append-only segments**, **reorga
 **Op-Engine Database** is a layered system:
 
 1. **Sharded in-memory tables** capture writes in memory for fast insertion.
-2. When a shard grows beyond a configurable threshold (the `memtable_size`), data is **flushed** to an **on-disk segment
-   **.
+2. When a shard grows beyond a configurable threshold (the `memtable_size`), data is **flushed** to an
+   **on-disk segment**.
 3. Each on-disk segment is accompanied by a B-Tree or similar index for rapid lookups without scanning entire files.
 4. **Reorg logic** allows rolling back recent writes if the underlying blockchain or ledger rewinds to a lower block
    height.
