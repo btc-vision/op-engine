@@ -6,6 +6,7 @@ use crate::domain::db::traits::key_provider::KeyProvider;
 use crate::domain::generic::errors::{OpNetError, OpNetResult};
 use crate::domain::io::{ByteReader, ByteWriter, CustomSerialize};
 use std::collections::HashMap;
+use std::marker::PhantomData;
 use std::sync::{Arc, Mutex, RwLock};
 
 #[derive(Clone, Debug)]
@@ -24,12 +25,11 @@ where
     T: KeyProvider,
 {
     pub(crate) name: String,
-    /// Instead of a single MemTable per collection, we now have a ShardedMemTable.
     pub(crate) sharded_tables: Arc<RwLock<HashMap<String, ShardedMemTable>>>,
     pub(crate) segment_manager: Arc<Mutex<SegmentManager>>,
     pub(crate) reorg_manager: Arc<Mutex<ReorgManager>>,
     pub(crate) metadata: CollectionMetadata,
-    _phantom: std::marker::PhantomData<T>,
+    _phantom: PhantomData<T>,
 }
 
 impl<T> Collection<T>
@@ -51,7 +51,7 @@ where
             segment_manager,
             reorg_manager,
             metadata,
-            _phantom: std::marker::PhantomData,
+            _phantom: PhantomData,
         }
     }
 
