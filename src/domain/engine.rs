@@ -1,12 +1,13 @@
 use crate::domain::blockchain::reorg::ReorgManager;
 use crate::domain::db::collection::{Collection, CollectionMetadata};
-use crate::domain::db::memtable::MemTable;
 use crate::domain::db::segments::segment::SegmentManager;
 use crate::domain::db::traits::key_provider::KeyProvider;
 use crate::domain::db::wal::WAL;
 use crate::domain::generic::config::DbConfig;
 use crate::domain::generic::errors::{OpNetError, OpNetResult};
 use crate::domain::thread::concurrency::ThreadPool;
+
+use crate::domain::db::sharded_memtable::ShardedMemTable;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -14,7 +15,7 @@ pub struct OpNetDB {
     pub config: DbConfig,
     pub thread_pool: Arc<Mutex<ThreadPool>>,
     pub wal: Arc<Mutex<WAL>>,
-    pub memtables: Arc<RwLock<HashMap<String, MemTable>>>,
+    pub sharded_tables: Arc<RwLock<HashMap<String, ShardedMemTable>>>,
     pub segment_manager: Arc<Mutex<SegmentManager>>,
     pub reorg_manager: Arc<Mutex<ReorgManager>>,
     pub collections: Arc<RwLock<HashMap<String, CollectionMetadata>>>,
@@ -24,22 +25,25 @@ impl OpNetDB {
     pub fn new(config: DbConfig) -> OpNetResult<Self> {
         let wal = WAL::open(&config.wal_path)?;
         let thread_pool = Arc::new(Mutex::new(ThreadPool::new(config.num_threads)));
-        let memtables = Arc::new(RwLock::new(HashMap::new()));
+
+        // Create an empty map of collection_name -> ShardedMemTable
+        let sharded_tables = Arc::new(RwLock::new(HashMap::new()));
+
         let segment_manager = SegmentManager::new(&config.data_path, Arc::clone(&thread_pool))?;
         let segment_manager = Arc::new(Mutex::new(segment_manager));
         let reorg_manager = Arc::new(Mutex::new(ReorgManager::new()));
-        let c_map = HashMap::new();
-
         reorg_manager
             .lock()
             .unwrap()
             .set_current_height(config.height);
 
+        let c_map = HashMap::new();
+
         Ok(OpNetDB {
             config,
             thread_pool,
             wal: Arc::new(Mutex::new(wal)),
-            memtables,
+            sharded_tables,
             segment_manager,
             reorg_manager,
             collections: Arc::new(RwLock::new(c_map)),
@@ -54,18 +58,23 @@ impl OpNetDB {
                 name
             )));
         }
+
         let metadata = CollectionMetadata::new(name);
         col_guard.insert(name.to_string(), metadata);
 
-        let mut mt_guard = self.memtables.write().unwrap();
-        if !mt_guard.contains_key(name) {
-            let mt = MemTable::new(self.config.memtable_size);
-            mt_guard.insert(name.to_string(), mt);
+        // Create a ShardedMemTable for this new collection
+        let mut st_guard = self.sharded_tables.write().unwrap();
+        if !st_guard.contains_key(name) {
+            // You can choose shard_count and max_size any way you like
+            let shard_count = 8; // example
+            let sharded_mem = ShardedMemTable::new(shard_count, self.config.memtable_size);
+            st_guard.insert(name.to_string(), sharded_mem);
         }
         Ok(())
     }
 
-    /// IMPORTANT: We now require T: KeyProvider
+    /// Returns a collection handle that references the sharded memtable,
+    /// the WAL, the SegmentManager, etc.
     pub fn collection<T>(&self, name: &str) -> OpNetResult<Collection<T>>
     where
         T: KeyProvider,
@@ -79,9 +88,10 @@ impl OpNetDB {
         }
         let metadata = col_guard.get(name).unwrap().clone();
 
+        // We pass in sharded_tables instead of memtables
         Ok(Collection::new(
             name.to_string(),
-            Arc::clone(&self.memtables),
+            Arc::clone(&self.sharded_tables),
             Arc::clone(&self.wal),
             Arc::clone(&self.segment_manager),
             Arc::clone(&self.reorg_manager),
@@ -89,16 +99,20 @@ impl OpNetDB {
         ))
     }
 
+    /// Flush *all* the sharded memtables to segments, then checkpoint WAL.
     pub fn flush_all(&self, flush_block_height: u64) -> OpNetResult<()> {
         let mut segmgr = self.segment_manager.lock().unwrap();
-        let mut guard = self.memtables.write().unwrap();
-        for (name, mem) in guard.iter_mut() {
-            if !mem.is_empty() {
-                segmgr.flush_memtable_to_segment(name, mem, flush_block_height)?;
-                mem.clear();
+
+        let mut map_guard = self.sharded_tables.write().unwrap();
+        for (name, sharded_mem) in map_guard.iter() {
+            // If this memtable is non-empty (total_size > 0), flush it
+            if sharded_mem.total_size() > 0 {
+                segmgr.flush_sharded_memtable_to_segment(name, sharded_mem, flush_block_height)?;
+                sharded_mem.clear_all();
             }
         }
 
+        // WAL checkpoint
         let mut wal_guard = self.wal.lock().unwrap();
         wal_guard.checkpoint()?;
         Ok(())
@@ -114,9 +128,10 @@ impl OpNetDB {
             segmgr.rollback_to_height(height)?;
         }
         {
-            let mut guard = self.memtables.write().unwrap();
-            for (_, mem) in guard.iter_mut() {
-                mem.clear();
+            // Clear all shards in memory
+            let mut map_guard = self.sharded_tables.write().unwrap();
+            for (_, sharded_mem) in map_guard.iter() {
+                sharded_mem.clear_all();
             }
         }
         Ok(())
@@ -152,7 +167,7 @@ mod tests {
         let sample = Utxo {
             tx_id: [0xab; 32],
             output_index: 0,
-            address: [0xcd; 20],
+            address: [0xcd; 33],
             amount: 10_000,
             script_pubkey: vec![0xAA, 0xBB, 0xCC],
             deleted_at_block: None,
@@ -253,7 +268,7 @@ mod tests {
         let sample = Utxo {
             tx_id: [0xcd; 32],
             output_index: 2,
-            address: [0xde; 20],
+            address: [0xde; 33],
             amount: 5000,
             script_pubkey: vec![0xAA],
             deleted_at_block: None,
@@ -323,7 +338,7 @@ mod tests {
             let sample = Utxo {
                 tx_id,
                 output_index: i,
-                address: [0xcd; 20],
+                address: [0xcd; 33],
                 amount: i as u64,
                 script_pubkey: vec![0xEE, 0xFF],
                 deleted_at_block: None,
@@ -380,7 +395,7 @@ mod tests {
         let sample1 = Utxo {
             tx_id: [1u8; 32],
             output_index: 0,
-            address: [0xcd; 20],
+            address: [0xcd; 33],
             amount: 1_000,
             script_pubkey: vec![0x01],
             deleted_at_block: None,
@@ -393,7 +408,7 @@ mod tests {
         let sample2 = Utxo {
             tx_id: [2u8; 32],
             output_index: 1,
-            address: [0xcd; 20],
+            address: [0xcd; 33],
             amount: 2_000,
             script_pubkey: vec![0x02],
             deleted_at_block: None,
@@ -454,7 +469,7 @@ mod tests {
                 let sample = Utxo {
                     tx_id,
                     output_index: i as u32,
-                    address: [0xcd; 20],
+                    address: [0xcd; 33],
                     amount: i as u64,
                     script_pubkey: vec![0x00],
                     deleted_at_block: None,
@@ -508,7 +523,7 @@ mod tests {
                     let sample = Utxo {
                         tx_id,
                         output_index: i,
-                        address: [0xaa; 20],
+                        address: [0xaa; 33],
                         amount,
                         script_pubkey: vec![0xAA, 0xBB],
                         deleted_at_block: None,
@@ -575,7 +590,7 @@ mod tests {
                 let sample = Utxo {
                     tx_id,
                     output_index: i as u32,
-                    address: [0xcd; 20],
+                    address: [0xcd; 33],
                     amount: i as u64,
                     script_pubkey: vec![0xEE, 0xFF],
                     deleted_at_block: None,

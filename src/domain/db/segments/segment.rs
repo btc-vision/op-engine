@@ -1,37 +1,38 @@
-use crate::domain::db::memtable::MemTable;
 use crate::domain::db::segments::b_tree_index::BTreeIndex;
 use crate::domain::db::segments::segment_metadata::SegmentMetadata;
 use crate::domain::generic::errors::{OpNetError, OpNetResult};
 use crate::domain::io::{ByteReader, ByteWriter};
 use crate::domain::thread::concurrency::ThreadPool;
+
+use crate::domain::db::sharded_memtable::ShardedMemTable;
 use std::fs::OpenOptions;
 use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-/// The manager that handles on-disk segments:
-/// - Each .seg file contains key-value pairs
-/// - Each .idx file stores a BTreeIndex of offsets
+/// The manager that handles on‐disk segments:
+/// - Each `.seg` file contains key‐value pairs
+/// - Each `.idx` file stores a `BTreeIndex` of offsets
 /// - We discover existing segments at startup
-/// - We can flush a MemTable into a new segment
+/// - We can flush a `MemTable` or `ShardedMemTable` into a new segment
 /// - We can look up keys by scanning from the newest segment to oldest
 /// - We can rollback (remove) segments above a certain block height
 pub struct SegmentManager {
-    /// The directory where .seg/.idx files live.
+    /// Directory where `.seg`/`.idx` files live
     data_dir: PathBuf,
 
-    /// A sorted list of known segments. Typically sorted ascending by start_height.
+    /// Sorted list of known segments, typically ascending by start_height
     pub segments: Vec<SegmentMetadata>,
 
-    /// For parallel I/O or parallel index loading, we store a handle to the same thread pool that the DB uses.
+    /// For parallel I/O or parallel index loading, store a handle to the same thread pool the DB uses
     thread_pool: Arc<Mutex<ThreadPool>>,
 
-    /// A simple lock that ensures only one flush at a time (to avoid interleaving writes).
+    /// A simple lock that ensures only one flush at a time (avoids interleaving writes)
     flush_lock: Mutex<()>,
 }
 
 impl SegmentManager {
-    /// Create a new `SegmentManager`, discover existing segments, and load their indexes in parallel.
+    /// Create a new `SegmentManager`, discover existing segments, load their indexes in parallel.
     pub fn new<P: AsRef<Path>>(
         data_path: P,
         thread_pool: Arc<Mutex<ThreadPool>>,
@@ -51,8 +52,9 @@ impl SegmentManager {
         Ok(manager)
     }
 
-    /// Scan the data directory for .seg files, parse out (start_height, end_height) from the filename,
-    /// and attempt to load the corresponding .idx file into a BTreeIndex.
+    /// ------------------------------------------------------------------
+    ///  Discover and load existing segments (.seg + .idx)
+    /// ------------------------------------------------------------------
     fn discover_existing_segments(&mut self) -> OpNetResult<()> {
         let entries = std::fs::read_dir(&self.data_dir)
             .map_err(|e| OpNetError::new(&format!("discover_segments: {}", e)))?;
@@ -63,11 +65,11 @@ impl SegmentManager {
             let path = entry.path();
             if path.extension().map(|ext| ext == "seg").unwrap_or(false) {
                 if let Some(fname) = path.file_name().and_then(|x| x.to_str()) {
-                    // Expect something like "collection_10_15.seg" or maybe "collection_10_15_2.seg"
+                    // Expect something like "collection_10_15.seg" or "collection_10_15_2.seg"
                     let parts: Vec<&str> = fname.split('.').collect();
                     if let Some(name_and_heights) = parts.get(0) {
                         let seg_parts: Vec<&str> = name_and_heights.split('_').collect();
-                        // We need at least 3 parts: [collName, start, end], ignoring any trailing suffix
+                        // We need at least 3 parts: [collName, start, end] ignoring trailing suffix
                         if seg_parts.len() >= 3 {
                             if let (Ok(start), Ok(end)) =
                                 (seg_parts[1].parse::<u64>(), seg_parts[2].parse::<u64>())
@@ -85,9 +87,9 @@ impl SegmentManager {
             }
         }
 
-        // -------------------------------------------------------------------
-        // LOAD INDEXES IN PARALLEL
-        // -------------------------------------------------------------------
+        // ------------------------------------------------------------------
+        //  Load indexes in parallel using the thread pool
+        // ------------------------------------------------------------------
         let mut join_handles = vec![];
         {
             let pool = self.thread_pool.lock().map_err(|_| {
@@ -96,14 +98,13 @@ impl SegmentManager {
 
             for mut seg_meta in discovered {
                 let idx_path = seg_meta.file_path.with_extension("idx");
-                // We'll create a task that loads the BTreeIndex (if present) from disk.
+                // Create a task that loads the BTreeIndex (if present) from disk.
                 let handle = pool.execute(move || {
                     if let Ok(file) = std::fs::File::open(&idx_path) {
                         let mut br = std::io::BufReader::new(file);
                         if let Ok(btree) = BTreeIndex::read_from_disk(&mut br) {
                             seg_meta.index = Some(Arc::new(btree));
                         } else {
-                            // If we can't read it properly, it's left as None
                             seg_meta.index = None;
                         }
                     }
@@ -121,19 +122,19 @@ impl SegmentManager {
             self.segments.push(seg_meta);
         }
 
-        // Sort segments by start_height, just to have them in ascending order
+        // Sort segments by start_height
         self.segments.sort_by_key(|s| s.start_height);
 
         Ok(())
     }
 
-    /// Flush the memtable to a new .seg file and corresponding .idx file.
-    /// This method does NOT clear the memtable. (Your tests expect the memtable to remain non-empty.)
-    /// If a file with the same (collection, start, end) already exists, we append `_2`, `_3`, etc.
-    pub fn flush_memtable_to_segment(
+    /// Similar to `flush_memtable_to_segment` but iterates over each shard in a `ShardedMemTable`.
+    /// Acquires the `flush_lock` so multiple flushes won't interfere.
+    /// **Note**: This method does NOT clear the sharded memtable; you can do that after success.
+    pub fn flush_sharded_memtable_to_segment(
         &mut self,
         collection_name: &str,
-        memtable: &mut MemTable,
+        sharded_mem: &ShardedMemTable,
         flush_block_height: u64,
     ) -> OpNetResult<()> {
         let _guard = self
@@ -141,16 +142,15 @@ impl SegmentManager {
             .lock()
             .map_err(|_| OpNetError::new("Failed to lock flush_lock"))?;
 
-        if memtable.is_empty() {
-            // Nothing to flush
+        // If total size is zero, nothing to flush
+        if sharded_mem.total_size() == 0 {
             return Ok(());
         }
 
-        // For this simplistic code, we treat the flush_block_height as both start and end.
         let start_height = flush_block_height;
         let end_height = flush_block_height;
 
-        // Base name is "collectionName_start_end.seg/.idx"
+        // Build a unique base filename
         let base_seg_filename = format!("{}_{}_{}", collection_name, start_height, end_height);
         let mut seg_file_name = format!("{}.seg", base_seg_filename);
         let mut idx_file_name = format!("{}.idx", base_seg_filename);
@@ -158,57 +158,68 @@ impl SegmentManager {
         let mut seg_path = self.data_dir.join(&seg_file_name);
         let mut idx_path = self.data_dir.join(&idx_file_name);
 
-        // If those files exist, we keep appending a numeric suffix to avoid overwriting
+        // Ensure unique files if they already exist
         let mut attempt = 2;
         while seg_path.exists() || idx_path.exists() {
             seg_file_name = format!("{}_{}", base_seg_filename, attempt);
             idx_file_name = format!("{}_{}.idx", base_seg_filename, attempt);
 
-            // We need to fix the extension properly
             seg_file_name.push_str(".seg");
             seg_path = self.data_dir.join(&seg_file_name);
-
-            // For idx, we already appended ".idx"
             idx_path = self.data_dir.join(&idx_file_name);
 
             attempt += 1;
         }
 
-        // Create & write the .seg file
+        // Create & write .seg
         let seg_file = OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(true)
             .open(&seg_path)
-            .map_err(|e| OpNetError::new(&format!("flush_memtable_to_segment open seg: {}", e)))?;
+            .map_err(|e| {
+                OpNetError::new(&format!(
+                    "flush_sharded_memtable_to_segment open seg: {}",
+                    e
+                ))
+            })?;
 
         let mut seg_writer = ByteWriter::new(BufWriter::new(seg_file));
-
         let mut btree = BTreeIndex::new();
 
-        // Write each (k, v) to .seg, building the btree in memory
-        for (k, v) in memtable.data.iter() {
-            let offset = seg_writer.position();
-            seg_writer.write_var_bytes(k)?; // key
-            seg_writer.write_var_bytes(v)?; // value
-            btree.insert(k.clone(), offset);
+        // ------------------------------------------------------------------
+        //  For each shard, lock it, iterate over (k,v) pairs, write them out
+        // ------------------------------------------------------------------
+        for shard_mutex in &sharded_mem.shards {
+            let shard = shard_mutex.lock().unwrap();
+            for (k, v) in shard.data.iter() {
+                let offset = seg_writer.position();
+                seg_writer.write_var_bytes(k)?; // key
+                seg_writer.write_var_bytes(v)?; // value
+                btree.insert(k.clone(), offset);
+            }
         }
 
         seg_writer.flush()?;
 
-        // Write the B-Tree to the .idx file
+        // Create the .idx file
         let idx_file = OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(true)
             .open(&idx_path)
-            .map_err(|e| OpNetError::new(&format!("flush_memtable_to_segment open idx: {}", e)))?;
+            .map_err(|e| {
+                OpNetError::new(&format!(
+                    "flush_sharded_memtable_to_segment open idx: {}",
+                    e
+                ))
+            })?;
 
         let mut bw = BufWriter::new(idx_file);
         btree.write_to_disk(&mut bw)?;
         bw.flush()?;
 
-        // Create a segment metadata entry
+        // Create a new segment metadata entry
         let meta = SegmentMetadata {
             file_path: seg_path,
             start_height,
@@ -216,24 +227,26 @@ impl SegmentManager {
             index: Some(Arc::new(btree)),
         };
         self.segments.push(meta);
-        // Keep them sorted
         self.segments.sort_by_key(|s| s.start_height);
 
         Ok(())
     }
 
-    /// Search from newest to oldest segment for a key. If found in a B-tree index, we read from .seg.
+    // ------------------------------------------------------------------
+    //  Querying & reading from segments
+    // ------------------------------------------------------------------
+
+    /// Search from newest to oldest segment for a key. If found in a B-tree index, read from `.seg`.
     pub fn find_value_for_key(
         &self,
         collection_name: &str,
         key: &[u8],
     ) -> OpNetResult<Option<Vec<u8>>> {
-        // Check from the newest segments to oldest
+        // Check from newest to oldest
         for seg in self.segments.iter().rev() {
-            // Quick check if segment belongs to this collection by prefix
+            // Quick check if the segment belongs to this collection by file prefix
             if let Some(fname) = seg.file_path.file_name().and_then(|x| x.to_str()) {
                 if !fname.starts_with(collection_name) {
-                    // If the .seg file name doesn't begin with the collection name, skip it
                     continue;
                 }
             }
@@ -250,8 +263,8 @@ impl SegmentManager {
         Ok(None)
     }
 
-    /// Return the value for all keys in [start_key, end_key], scanning from newest to oldest,
-    /// skipping duplicates, up to `limit`.
+    /// Return up to `limit` values for keys in [start_key, end_key] by scanning from newest to oldest,
+    /// skipping duplicates.
     pub fn find_values_in_range(
         &self,
         collection_name: &str,
@@ -263,6 +276,7 @@ impl SegmentManager {
         let mut results = Vec::new();
         let mut seen_keys = HashSet::new();
 
+        // Again, newest to oldest
         for seg in self.segments.iter().rev() {
             if let Some(fname) = seg.file_path.file_name().and_then(|x| x.to_str()) {
                 if !fname.starts_with(collection_name) {
@@ -271,6 +285,7 @@ impl SegmentManager {
             }
 
             if let Some(ref btree) = seg.index {
+                // Range search in the B-tree index
                 let items = btree.range_search(start_key, end_key, Some(limit - results.len()));
                 for (k, offset) in items {
                     if seen_keys.contains(&k) {
@@ -293,7 +308,7 @@ impl SegmentManager {
         Ok(results)
     }
 
-    /// Reads a record (K, V) from a .seg file at the given `offset`, and verifies that the stored key == `search_key`.
+    /// Reads a record (K,V) from a `.seg` file at the given `offset`, verifying that the stored key == `search_key`.
     pub fn read_record_from_segment(
         &self,
         seg_path: &Path,
@@ -309,30 +324,29 @@ impl SegmentManager {
         let stored_key = match br.read_var_bytes() {
             Ok(k) => k,
             Err(_) => {
-                // If for some reason we fail to read the key (offset out-of-bounds),
-                // return Ok(None) or an error. We can do either.
+                // offset out-of-bounds or corrupted => return None
                 return Ok(None);
             }
         };
 
         if stored_key != search_key {
-            // Collision or mismatch => not our record
+            // Key mismatch => not our record
             return Ok(None);
         }
 
         let val = match br.read_var_bytes() {
             Ok(v) => v,
-            Err(_) => {
-                return Ok(None);
-            }
+            Err(_) => return Ok(None),
         };
-
         Ok(Some(val))
     }
 
-    /// Remove any segments whose `end_height` is above `height`, also deleting their files.
+    // ------------------------------------------------------------------
+    //  Rollback logic
+    // ------------------------------------------------------------------
+    /// Remove any segments whose `end_height` is above `height`, also deleting their files from disk.
     pub fn rollback_to_height(&mut self, height: u64) -> OpNetResult<()> {
-        // Collect segments to remove
+        // Identify which segments to remove
         let to_remove: Vec<usize> = self
             .segments
             .iter()
@@ -341,14 +355,15 @@ impl SegmentManager {
             .map(|(idx, _)| idx)
             .collect();
 
-        // Remove in reverse order so we don't shift indexes mid-loop
+        // Remove them in reverse order so we don't mess up indexes
         for idx in to_remove.into_iter().rev() {
             let seg = self.segments.remove(idx);
-            // Delete seg file and index file from disk
+            // Attempt to delete seg file and idx file
             let _ = std::fs::remove_file(&seg.file_path);
             let idx_path = seg.file_path.with_extension("idx");
             let _ = std::fs::remove_file(idx_path);
         }
+
         Ok(())
     }
 }
@@ -356,19 +371,22 @@ impl SegmentManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::db::memtable::MemTable;
     use crate::domain::thread::concurrency::ThreadPool;
     use std::fs::{create_dir_all, File};
     use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
 
-    /// Helper to create a default in‐memory MemTable with some dummy data.
-    fn make_memtable(pairs: &[(Vec<u8>, Vec<u8>)]) -> MemTable {
-        let mut memtable = MemTable::new(1_000_000);
+    /// Helper to create a default in-memory ShardedMemTable with some dummy data.
+    fn make_sharded_memtable(pairs: &[(Vec<u8>, Vec<u8>)]) -> ShardedMemTable {
+        // You can tweak shard_count or max_size to fit your needs.
+        let shard_count = 4;
+        let max_size = 1_000_000;
+        let sharded = ShardedMemTable::new(shard_count, max_size);
+
         for (k, v) in pairs {
-            memtable.data.insert(k.clone(), v.clone());
+            sharded.insert(k.clone(), v.clone());
         }
-        memtable
+        sharded
     }
 
     /// Create a new SegmentManager in a temporary directory.
@@ -392,6 +410,44 @@ mod tests {
         );
         // Check that the directory was created
         assert!(tmp_dir.path().exists());
+    }
+
+    /// Test flushing a ShardedMemTable with a few keys.
+    #[test]
+    fn test_flush_sharded_memtable_to_segment() {
+        let tmp_dir = TempDir::new().unwrap();
+        let tp = Arc::new(Mutex::new(ThreadPool::new(2)));
+        let mut seg_mgr =
+            SegmentManager::new(tmp_dir.path(), tp).expect("Failed to create SegmentManager");
+
+        let shard_count = 4;
+        let max_size = 1_000_000;
+        let sharded = ShardedMemTable::new(shard_count, max_size);
+
+        // Insert some keys across shards
+        sharded.insert(b"key1".to_vec(), b"value1".to_vec());
+        sharded.insert(b"key2".to_vec(), b"value2".to_vec());
+        sharded.insert(b"another".to_vec(), b"someval".to_vec());
+
+        // Flush
+        seg_mgr
+            .flush_sharded_memtable_to_segment("sharded_test", &sharded, 77)
+            .expect("Flush sharded memtable must succeed");
+
+        // Now we should have 1 segment in seg_mgr
+        assert_eq!(seg_mgr.segments.len(), 1);
+
+        // Confirm we can read them
+        let got1 = seg_mgr.find_value_for_key("sharded_test", b"key1").unwrap();
+        assert_eq!(got1, Some(b"value1".to_vec()));
+
+        let got2 = seg_mgr.find_value_for_key("sharded_test", b"key2").unwrap();
+        assert_eq!(got2, Some(b"value2".to_vec()));
+
+        let got_a = seg_mgr
+            .find_value_for_key("sharded_test", b"another")
+            .unwrap();
+        assert_eq!(got_a, Some(b"someval".to_vec()));
     }
 
     #[test]
@@ -422,64 +478,22 @@ mod tests {
     }
 
     #[test]
-    fn test_flush_memtable_to_segment() {
-        let (tmp_dir, mut seg_mgr) = make_segment_manager();
-
-        // Start with an empty memtable
-        let mut empty_mem = make_memtable(&[]);
-        // Flushing empty memtable => no new segments
-        seg_mgr
-            .flush_memtable_to_segment("coll", &mut empty_mem, 100)
-            .unwrap();
-        assert!(seg_mgr.segments.is_empty(), "Empty flush => no new segment");
-
-        // Now flush with data
-        let mut mem = make_memtable(&[
-            (b"key1".to_vec(), b"value1".to_vec()),
-            (b"key2".to_vec(), b"value2".to_vec()),
-        ]);
-        seg_mgr
-            .flush_memtable_to_segment("coll", &mut mem, 101)
-            .unwrap();
-
-        // We expect one new segment
-        assert_eq!(seg_mgr.segments.len(), 1, "Should have 1 new segment");
-        let seg = &seg_mgr.segments[0];
-        assert_eq!(seg.start_height, 101);
-        assert_eq!(seg.end_height, 101);
-        assert!(
-            seg.index.is_some(),
-            "Should have an in‐memory BTree index loaded"
-        );
-
-        // The .seg file and .idx file should exist on disk
-        let seg_file_name = format!("coll_{}_{}.seg", 101, 101);
-        let idx_file_name = format!("coll_{}_{}.idx", 101, 101);
-        let seg_path = tmp_dir.path().join(seg_file_name);
-        let idx_path = tmp_dir.path().join(idx_file_name);
-        assert!(seg_path.exists(), "Segment file must exist");
-        assert!(idx_path.exists(), "Index file must exist");
-
-        // The code does not clear the memtable by default.
-        assert!(!mem.is_empty(), "Memtable remains non‐empty after flush");
-    }
-
-    #[test]
     fn test_find_value_for_key() {
+        // We'll flush a small sharded memtable with data, then do lookups
         let (_tmp_dir, mut seg_mgr) = make_segment_manager();
-        let mut mem = make_memtable(&[
+        let sharded = make_sharded_memtable(&[
             (b"apple".to_vec(), b"red".to_vec()),
             (b"banana".to_vec(), b"yellow".to_vec()),
         ]);
+
         seg_mgr
-            .flush_memtable_to_segment("fruits", &mut mem, 50)
+            .flush_sharded_memtable_to_segment("fruits", &sharded, 50)
             .unwrap();
-        // Now the data is in the single segment with block range [50..50]
+        // Now the data is in a single segment with block range [50..50]
 
         // Test an existing key
         let found = seg_mgr.find_value_for_key("fruits", b"apple").unwrap();
-        assert!(found.is_some());
-        assert_eq!(found.unwrap(), b"red");
+        assert_eq!(found, Some(b"red".to_vec()));
 
         // Test a missing key
         let not_found = seg_mgr.find_value_for_key("fruits", b"grape").unwrap();
@@ -494,30 +508,25 @@ mod tests {
     fn test_rollback_to_height() {
         let (_tmp_dir, mut seg_mgr) = make_segment_manager();
 
-        // We simulate that we have three segments covering block heights 100, 101..102, and 103
-        // We'll do it by manually flushing.
-
-        // 1) flush block 100
-        let mut mem_a = make_memtable(&[(b"a1".to_vec(), b"val100".to_vec())]);
+        // We'll flush 3 different sharded memtables at block=100, 101, 103
+        let shard_a = make_sharded_memtable(&[(b"a1".to_vec(), b"val100".to_vec())]);
         seg_mgr
-            .flush_memtable_to_segment("test", &mut mem_a, 100)
+            .flush_sharded_memtable_to_segment("test", &shard_a, 100)
             .unwrap();
 
-        // 2) flush block 101
-        let mut mem_b = make_memtable(&[(b"b1".to_vec(), b"val101".to_vec())]);
+        let shard_b = make_sharded_memtable(&[(b"b1".to_vec(), b"val101".to_vec())]);
         seg_mgr
-            .flush_memtable_to_segment("test", &mut mem_b, 101)
+            .flush_sharded_memtable_to_segment("test", &shard_b, 101)
             .unwrap();
 
-        // 3) flush block 103
-        let mut mem_c = make_memtable(&[(b"c1".to_vec(), b"val103".to_vec())]);
+        let shard_c = make_sharded_memtable(&[(b"c1".to_vec(), b"val103".to_vec())]);
         seg_mgr
-            .flush_memtable_to_segment("test", &mut mem_c, 103)
+            .flush_sharded_memtable_to_segment("test", &shard_c, 103)
             .unwrap();
 
         assert_eq!(seg_mgr.segments.len(), 3);
 
-        // Now let's rollback to height=101. Only block 103 is above 101, so remove that segment.
+        // Rollback to height=101 => remove the segment above 101 (which is 103)
         seg_mgr.rollback_to_height(101).unwrap();
         assert_eq!(
             seg_mgr.segments.len(),
@@ -525,7 +534,7 @@ mod tests {
             "Should have removed the segment above block 101"
         );
 
-        // The last segment we created was for block 103 => it should be gone
+        // The removed segment was block 103
         assert_eq!(seg_mgr.segments[0].start_height, 100);
         assert_eq!(seg_mgr.segments[0].end_height, 100);
         assert_eq!(seg_mgr.segments[1].start_height, 101);
@@ -535,14 +544,15 @@ mod tests {
     #[test]
     fn test_file_cleanup_on_rollback() {
         let (tmp_dir, mut seg_mgr) = make_segment_manager();
-        let mut mem_1 = make_memtable(&[(b"one".to_vec(), b"111".to_vec())]);
+
+        let shard_1 = make_sharded_memtable(&[(b"one".to_vec(), b"111".to_vec())]);
         seg_mgr
-            .flush_memtable_to_segment("mycoll", &mut mem_1, 10)
+            .flush_sharded_memtable_to_segment("mycoll", &shard_1, 10)
             .unwrap();
 
-        let mut mem_2 = make_memtable(&[(b"two".to_vec(), b"222".to_vec())]);
+        let shard_2 = make_sharded_memtable(&[(b"two".to_vec(), b"222".to_vec())]);
         seg_mgr
-            .flush_memtable_to_segment("mycoll", &mut mem_2, 12)
+            .flush_sharded_memtable_to_segment("mycoll", &shard_2, 12)
             .unwrap();
 
         // We have 2 segments: mycoll_10_10 and mycoll_12_12
@@ -567,7 +577,7 @@ mod tests {
 
     #[test]
     fn test_concurrent_discovery_runs_ok() {
-        // This test ensures the parallel code in `discover_existing_segments` doesn't crash
+        // This test ensures the parallel code in discover_existing_segments doesn't crash
         // with multiple segment files. It doesn't do heavy concurrency checks, but verifies
         // the parallel tasks complete and the segment list is filled.
 
@@ -596,10 +606,10 @@ mod tests {
     fn test_read_record_from_segment() {
         let (tmp_dir, mut seg_mgr) = make_segment_manager();
 
-        // Create a MemTable with one K=[1,2,3], V=[4,5,6]
-        let mut mem = make_memtable(&[(vec![1, 2, 3], vec![4, 5, 6])]);
+        // Create a sharded memtable with one K=[1,2,3], V=[4,5,6]
+        let shard = make_sharded_memtable(&[(vec![1, 2, 3], vec![4, 5, 6])]);
         seg_mgr
-            .flush_memtable_to_segment("test", &mut mem, 50)
+            .flush_sharded_memtable_to_segment("test", &shard, 50)
             .unwrap();
 
         assert_eq!(seg_mgr.segments.len(), 1);
@@ -621,21 +631,21 @@ mod tests {
     }
 
     #[test]
-    fn test_flush_memtable_multiple_times() {
+    fn test_flush_sharded_memtable_multiple_times() {
         // Verifies that multiple flushes create multiple segments and the manager handles them properly.
         let (_tmp_dir, mut seg_mgr) = make_segment_manager();
 
         // Flush #1
-        let mut mem_1 = make_memtable(&[(b"hello".to_vec(), b"world".to_vec())]);
+        let shard_1 = make_sharded_memtable(&[(b"hello".to_vec(), b"world".to_vec())]);
         seg_mgr
-            .flush_memtable_to_segment("coll", &mut mem_1, 10)
+            .flush_sharded_memtable_to_segment("coll", &shard_1, 10)
             .unwrap();
         assert_eq!(seg_mgr.segments.len(), 1);
 
         // Flush #2
-        let mut mem_2 = make_memtable(&[(b"foo".to_vec(), b"bar".to_vec())]);
+        let shard_2 = make_sharded_memtable(&[(b"foo".to_vec(), b"bar".to_vec())]);
         seg_mgr
-            .flush_memtable_to_segment("coll", &mut mem_2, 11)
+            .flush_sharded_memtable_to_segment("coll", &shard_2, 11)
             .unwrap();
         assert_eq!(seg_mgr.segments.len(), 2);
 
@@ -651,9 +661,9 @@ mod tests {
     }
 
     #[test]
-    fn test_flush_memtable_concurrent_calls() {
+    fn test_flush_sharded_memtable_concurrent_calls() {
         // Check that calling flush concurrently from multiple threads does not corrupt data or panic.
-        // We'll spawn N threads, each flushes a different memtable. Because of `flush_lock`, they should
+        // We'll spawn N threads, each flushes a different set of data. Because of `flush_lock`, they should
         // effectively serialize, but we ensure the final state is correct.
 
         use std::thread;
@@ -665,14 +675,14 @@ mod tests {
         for i in 0..5 {
             let seg_mgr_clone = seg_mgr_arc.clone();
             handles.push(thread::spawn(move || {
-                let mut mem = make_memtable(&[(
+                let shard = make_sharded_memtable(&[(
                     format!("key{i}").into_bytes(),
                     format!("val{i}").into_bytes(),
                 )]);
                 // Acquire a lock on seg_mgr and flush
                 let mut guard = seg_mgr_clone.lock().unwrap();
                 guard
-                    .flush_memtable_to_segment("concurrent", &mut mem, 100 + i as u64)
+                    .flush_sharded_memtable_to_segment("concurrent", &shard, 100 + i as u64)
                     .unwrap();
             }));
         }
@@ -684,11 +694,7 @@ mod tests {
 
         // Now check we have 5 segments in ascending block height order
         let seg_mgr_final = seg_mgr_arc.lock().unwrap();
-        assert_eq!(
-            seg_mgr_final.segments.len(),
-            5,
-            "Should have 5 segments from concurrent flush"
-        );
+        assert_eq!(seg_mgr_final.segments.len(), 5, "Should have 5 segments");
         for (i, seg) in seg_mgr_final.segments.iter().enumerate() {
             assert_eq!(seg.start_height, 100 + i as u64);
             // Retrieve the key from each
@@ -707,9 +713,9 @@ mod tests {
         let (_tmp_dir, mut seg_mgr) = make_segment_manager();
 
         // Create a segment at block=10
-        let mut mem = make_memtable(&[(b"cat".to_vec(), b"meow".to_vec())]);
+        let shard = make_sharded_memtable(&[(b"cat".to_vec(), b"meow".to_vec())]);
         seg_mgr
-            .flush_memtable_to_segment("test", &mut mem, 10)
+            .flush_sharded_memtable_to_segment("test", &shard, 10)
             .unwrap();
         assert_eq!(seg_mgr.segments.len(), 1);
 
@@ -763,9 +769,9 @@ mod tests {
         let (_tmp_dir, mut seg_mgr) = make_segment_manager();
 
         // Create an actual .seg file with a single record
-        let mut mem = make_memtable(&[(b"abc".to_vec(), b"def".to_vec())]);
+        let shard = make_sharded_memtable(&[(b"abc".to_vec(), b"def".to_vec())]);
         seg_mgr
-            .flush_memtable_to_segment("test", &mut mem, 1)
+            .flush_sharded_memtable_to_segment("test", &shard, 1)
             .unwrap();
         assert_eq!(seg_mgr.segments.len(), 1);
 
@@ -796,7 +802,7 @@ mod tests {
         use std::time::Instant;
 
         // We’ll measure how long it takes to:
-        // 1) flush multiple large memtables,
+        // 1) flush multiple large sharded memtables,
         // 2) read random keys back.
 
         // Adjust these for your desired test scale
@@ -806,7 +812,7 @@ mod tests {
         // Create fresh SegmentManager
         let (_tmp_dir, mut seg_mgr) = make_segment_manager();
 
-        // 1) Measure the time to flush multiple memtables
+        // 1) Measure the time to flush multiple sharded memtables
         let start_flush = Instant::now();
         for flush_index in 0..NUM_FLUSHES {
             let mut data = Vec::with_capacity(ITEMS_PER_FLUSH);
@@ -816,14 +822,18 @@ mod tests {
                 let val = format!("val-{}-{}", flush_index, i).into_bytes();
                 data.push((key, val));
             }
-            let mut memtable = make_memtable(&data);
+            let sharded_mem = make_sharded_memtable(&data);
             seg_mgr
-                .flush_memtable_to_segment("perf_test", &mut memtable, 1000 + flush_index as u64)
+                .flush_sharded_memtable_to_segment(
+                    "perf_test",
+                    &sharded_mem,
+                    1000 + flush_index as u64,
+                )
                 .expect("flush memtable failed");
         }
         let flush_duration = start_flush.elapsed();
         println!(
-            "Flushed {} memtables of {} items each in: {:?}",
+            "Flushed {} sharded memtables of {} items each in: {:?}",
             NUM_FLUSHES, ITEMS_PER_FLUSH, flush_duration
         );
 
@@ -832,7 +842,7 @@ mod tests {
         let mut rng = rng();
         let start_read = Instant::now();
         // We'll do some random lookups
-        let lookups = 50000;
+        let lookups = 50_000;
         for _ in 0..lookups {
             // pick a flush index and an item index
             let f_idx = rng.random_range(0..NUM_FLUSHES);
@@ -853,13 +863,14 @@ mod tests {
 
     #[test]
     fn test_discover_valid_index_file() {
-        // 1) Create a SegmentManager and flush a MemTable to produce a .seg and .idx on disk
+        // 1) Create a SegmentManager and flush a ShardedMemTable to produce a .seg and .idx on disk
         let (tmp_dir, mut seg_mgr) = make_segment_manager();
 
-        // Write out a memtable with a single key-value pair
-        let mut memtable = make_memtable(&[(b"discovery_key".to_vec(), b"discovery_val".to_vec())]);
+        // Write out a sharded memtable with a single key-value pair
+        let sharded_mem =
+            make_sharded_memtable(&[(b"discovery_key".to_vec(), b"discovery_val".to_vec())]);
         seg_mgr
-            .flush_memtable_to_segment("disc", &mut memtable, 42)
+            .flush_sharded_memtable_to_segment("disc", &sharded_mem, 42)
             .expect("Flush should succeed");
 
         // Confirm we have exactly one segment
@@ -888,7 +899,7 @@ mod tests {
         );
 
         // 4) Confirm that we can read the same key via find_value_for_key,
-        //    which demonstrates that `BTreeIndex::read_from_disk` actually returned Ok(btree).
+        //    which demonstrates that BTreeIndex::read_from_disk actually returned Ok(btree).
         let found = seg_mgr2
             .find_value_for_key("disc", b"discovery_key")
             .expect("find_value_for_key should not error");

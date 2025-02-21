@@ -7,7 +7,7 @@ use crate::domain::io::{ByteReader, ByteWriter, CustomSerialize};
 pub struct Utxo {
     pub tx_id: [u8; 32],
     pub output_index: u32,
-    pub address: [u8; 20],
+    pub address: [u8; 33],
     pub amount: u64,
     pub script_pubkey: Vec<u8>,
     pub deleted_at_block: Option<u64>,
@@ -41,8 +41,8 @@ impl CustomSerialize for Utxo {
         tx_id.copy_from_slice(&txid_bytes);
 
         let output_index = reader.read_u32()?;
-        let addr_bytes = reader.read_bytes(20)?;
-        let mut address = [0u8; 20];
+        let addr_bytes = reader.read_bytes(33)?;
+        let mut address = [0u8; 33];
         address.copy_from_slice(&addr_bytes);
 
         let amount = reader.read_u64()?;
@@ -115,7 +115,7 @@ mod tests_mark_spent {
         Utxo {
             tx_id,
             output_index: vout,
-            address: [0xAA; 20],
+            address: [0xAA; 33],
             amount,
             script_pubkey: vec![0xAB, 0xCD],
             deleted_at_block: None,

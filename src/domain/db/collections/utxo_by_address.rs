@@ -7,7 +7,7 @@ use std::io::{Read, Write};
 
 #[derive(Clone, Debug)]
 pub struct UtxoByAddressRef {
-    pub address: [u8; 20],
+    pub address: [u8; 33],
     pub tx_id: [u8; 32],
     pub output_index: u32,
 }
@@ -25,8 +25,8 @@ impl CustomSerialize for UtxoByAddressRef {
 
     fn deserialize<R: Read>(reader: &mut ByteReader<R>) -> OpNetResult<Self> {
         // Read address
-        let addr_bytes = reader.read_bytes(20)?;
-        let mut address = [0u8; 20];
+        let addr_bytes = reader.read_bytes(33)?;
+        let mut address = [0u8; 33];
         address.copy_from_slice(&addr_bytes);
 
         // Read txid
@@ -47,11 +47,11 @@ impl CustomSerialize for UtxoByAddressRef {
 
 impl KeyProvider for UtxoByAddressRef {
     // The "lookup arguments" if someone wants to fetch it exactly would be (address, txid, output_index).
-    type KeyArgs = ([u8; 20], [u8; 32], u32);
+    type KeyArgs = ([u8; 33], [u8; 32], u32);
 
     fn primary_key(&self) -> Vec<u8> {
         // Construct [ address (20 bytes) + txid (32 bytes) + outputIndex (4 bytes) ]
-        let mut buf = Vec::with_capacity(20 + 32 + 4);
+        let mut buf = Vec::with_capacity(33 + 32 + 4);
         buf.extend_from_slice(&self.address);
         buf.extend_from_slice(&self.tx_id);
         buf.extend_from_slice(&self.output_index.to_le_bytes());
@@ -60,7 +60,7 @@ impl KeyProvider for UtxoByAddressRef {
 
     fn compose_key(args: &Self::KeyArgs) -> Vec<u8> {
         let (addr, txid, vout) = args;
-        let mut buf = Vec::with_capacity(20 + 32 + 4);
+        let mut buf = Vec::with_capacity(33 + 32 + 4);
         buf.extend_from_slice(addr);
         buf.extend_from_slice(txid);
         buf.extend_from_slice(&vout.to_le_bytes());
@@ -69,11 +69,12 @@ impl KeyProvider for UtxoByAddressRef {
 }
 
 impl Collection<UtxoByAddressRef> {
-    /// Finds all references for a given address, then fetches full UTXOs from the main collection.
-    /// Applies `deleted_at_block == None` + optional `min_value` filter.
+    /// Finds all references for a given address, then fetches full UTXOs
+    /// from the main collection. Applies `deleted_at_block == None` +
+    /// optional `min_value` filter, respecting `limit`.
     pub fn find_unspent_utxos_for_address(
         &self,
-        address: [u8; 20],
+        address: [u8; 33],
         min_value: Option<u64>,
         limit: usize,
         main_utxo_collection: &Collection<Utxo>,
@@ -81,55 +82,71 @@ impl Collection<UtxoByAddressRef> {
         use crate::domain::io::ByteReader;
         use std::collections::HashSet;
 
-        // Build start_key = [address + all-zeros], end_key = [address + all-FF]
-        let mut start_key = Vec::with_capacity(56);
+        // ------------------------------------------------------
+        // 1) Build start/end keys for segment range lookup
+        // ------------------------------------------------------
+        let mut start_key = Vec::with_capacity(36 + 33);
         start_key.extend_from_slice(&address);
         start_key.extend_from_slice(&[0u8; 36]);
 
-        let mut end_key = Vec::with_capacity(56);
+        let mut end_key = Vec::with_capacity(36 + 33);
         end_key.extend_from_slice(&address);
         end_key.extend_from_slice(&[0xFF; 36]);
 
-        // 1) Query the address-based index in the segment files
-        let segmgr = self.segment_manager.lock().unwrap();
-        let raw_refs = segmgr.find_values_in_range(&self.name, &start_key, &end_key, limit)?;
-
-        // 2) Query the memtable for any references that haven't been flushed
-        //    (Naive approach, scanning the entire memtable HashMap.)
-        let mem_guard = self.memtables.read().unwrap();
-        let mem = mem_guard
-            .get(&self.name)
-            .ok_or_else(|| OpNetError::new("No memtable for this collection"))?;
-
+        // ------------------------------------------------------
+        // 2) Collect from the *sharded* memtable
+        // ------------------------------------------------------
         let mut memtable_refs = Vec::new();
-        for (k, v) in &mem.data {
-            // Check if the first 20 bytes match the address
-            if k.len() >= 20 && &k[0..20] == address {
-                let mut rdr = ByteReader::new(&v[..]);
+        {
+            // Lock the RwLock that holds: HashMap<String, ShardedMemTable>
+            let shard_map_guard = self.sharded_tables.read().unwrap();
+            // Get the ShardedMemTable for this collection name
+            let sharded_mem = shard_map_guard
+                .get(&self.name)
+                .ok_or_else(|| OpNetError::new("No sharded memtable for this collection"))?;
+
+            // For each shard, lock and iterate over key-value pairs
+            for shard_mutex in &sharded_mem.shards {
+                let shard = shard_mutex.lock().unwrap();
+                // Scan the entire shard HashMap for keys matching the first 20 bytes == address
+                for (k, v) in &shard.data {
+                    if k.len() >= 33 && &k[0..33] == address {
+                        let mut rdr = ByteReader::new(&v[..]);
+                        if let Ok(ref_obj) = UtxoByAddressRef::deserialize(&mut rdr) {
+                            memtable_refs.push(ref_obj);
+                        }
+                    }
+                }
+            }
+        } // sharded_tables lock is DROPPED here
+
+        // ------------------------------------------------------
+        // 3) Collect from SEGMENTS
+        // ------------------------------------------------------
+        let mut segment_refs = Vec::new();
+        {
+            let segmgr = self.segment_manager.lock().unwrap();
+            let raw_refs = segmgr.find_values_in_range(&self.name, &start_key, &end_key, limit)?;
+
+            for raw in raw_refs {
+                let mut rdr = ByteReader::new(&raw[..]);
                 if let Ok(ref_obj) = UtxoByAddressRef::deserialize(&mut rdr) {
-                    memtable_refs.push(ref_obj);
+                    segment_refs.push(ref_obj);
                 }
             }
         }
-        drop(mem_guard); // done reading memtable
 
-        // Convert segment results into UtxoByAddressRef
-        let mut all_refs = Vec::new();
-        for raw in raw_refs {
-            let mut rdr = ByteReader::new(&raw[..]);
-            if let Ok(ref_obj) = UtxoByAddressRef::deserialize(&mut rdr) {
-                all_refs.push(ref_obj);
-            }
-        }
+        // ------------------------------------------------------
+        // 4) Merge memtable + segment references
+        // ------------------------------------------------------
+        // We put memtable refs first (assuming they're "newer"), then segment refs.
+        // Then we deduplicate by (tx_id, vout).
+        let mut all_refs = memtable_refs;
+        all_refs.extend(segment_refs);
 
-        // Insert memtable references “on top” (assuming they’re newer)
-        for r in memtable_refs {
-            all_refs.insert(0, r);
-        }
-
-        // 3) De‐duplicate references by (tx_id, vout) in case older segments also contain them
         let mut final_refs = Vec::new();
         let mut seen_pairs = HashSet::new();
+
         for r in all_refs {
             let pair = (r.tx_id, r.output_index);
             if !seen_pairs.contains(&pair) {
@@ -141,14 +158,14 @@ impl Collection<UtxoByAddressRef> {
             }
         }
 
-        // 4) For each reference, do a second .get(...) in the main collection
+        // ------------------------------------------------------
+        // 5) For each reference, call main_utxo_collection.get
+        // ------------------------------------------------------
         let mut results = Vec::new();
         let min_val = min_value.unwrap_or(0);
+
         for r in final_refs {
-            // The main UTXO key is (tx_id, output_index)
-            let maybe_utxo = main_utxo_collection.get(&(r.tx_id, r.output_index))?;
-            if let Some(utxo) = maybe_utxo {
-                // If the record is unspent and meets min_value
+            if let Some(utxo) = main_utxo_collection.get(&(r.tx_id, r.output_index))? {
                 if utxo.deleted_at_block.is_none() && utxo.amount >= min_val {
                     results.push(utxo);
                     if results.len() >= limit {
@@ -170,7 +187,7 @@ mod tests_utxo_by_address {
     use std::collections::HashSet;
 
     /// Helper for quickly building a main Utxo
-    fn make_utxo(txid_byte: u8, vout: u32, address: [u8; 20], amount: u64) -> Utxo {
+    fn make_utxo(txid_byte: u8, vout: u32, address: [u8; 33], amount: u64) -> Utxo {
         let mut tx_id = [0u8; 32];
         tx_id[0] = txid_byte;
         Utxo {
@@ -184,7 +201,7 @@ mod tests_utxo_by_address {
     }
 
     /// Helper for building the address-reference collection entry
-    fn make_address_ref(address: [u8; 20], tx_id: [u8; 32], vout: u32) -> UtxoByAddressRef {
+    fn make_address_ref(address: [u8; 33], tx_id: [u8; 32], vout: u32) -> UtxoByAddressRef {
         UtxoByAddressRef {
             address,
             tx_id,
@@ -204,7 +221,7 @@ mod tests_utxo_by_address {
         let addr_coll = db.collection::<UtxoByAddressRef>("utxo_by_address")?;
 
         // We do not insert anything, so no results for any address
-        let empty_addr = [0x00; 20];
+        let empty_addr = [0x00; 33];
         let found = addr_coll.find_unspent_utxos_for_address(empty_addr, None, 10, &main_coll)?;
         assert!(found.is_empty(), "Should find no UTXOs for empty DB");
 
@@ -224,7 +241,7 @@ mod tests_utxo_by_address {
         let addr_coll = db.collection::<UtxoByAddressRef>("utxo_by_address")?;
 
         // Insert a couple of UTXOs
-        let addr1 = [0xAA; 20];
+        let addr1 = [0xAA; 33];
         let utxo1 = make_utxo(0x01, 0, addr1, 1000);
         main_coll.insert(utxo1.clone(), 10)?;
 
@@ -232,7 +249,7 @@ mod tests_utxo_by_address {
         let addr_ref1 = make_address_ref(addr1, utxo1.tx_id, utxo1.output_index);
         addr_coll.insert(addr_ref1, 10)?;
 
-        let addr2 = [0xBB; 20];
+        let addr2 = [0xBB; 33];
         let utxo2 = make_utxo(0x02, 0, addr2, 5000);
         main_coll.insert(utxo2.clone(), 11)?;
 
@@ -251,7 +268,7 @@ mod tests_utxo_by_address {
         assert_eq!(found_addr2[0].amount, 5000);
 
         // A random address => no results
-        let rand_addr = [0xCC; 20];
+        let rand_addr = [0xCC; 33];
         let found_rand =
             addr_coll.find_unspent_utxos_for_address(rand_addr, None, 10, &main_coll)?;
         assert!(found_rand.is_empty());
@@ -271,7 +288,7 @@ mod tests_utxo_by_address {
         let main_coll = db.collection::<Utxo>("utxo")?;
         let addr_coll = db.collection::<UtxoByAddressRef>("utxo_by_address")?;
 
-        let addr = [0x99; 20];
+        let addr = [0x99; 33];
 
         // Insert 3 UTXOs to the same address, different amounts
         let utxo_a = make_utxo(0xA0, 0, addr, 1000);
@@ -331,7 +348,7 @@ mod tests_utxo_by_address {
         let main_coll = db.collection::<Utxo>("utxo")?;
         let addr_coll = db.collection::<UtxoByAddressRef>("utxo_by_address")?;
 
-        let addr = [0x55; 20];
+        let addr = [0x55; 33];
 
         // Insert 5 UTXOs
         for i in 0..5 {
@@ -361,31 +378,23 @@ mod tests_utxo_by_address {
         db.register_collection("utxo")?;
         db.register_collection("utxo_by_address")?;
 
-        println!("making elements.");
-
         let main_coll = db.collection::<Utxo>("utxo")?;
         let addr_coll = db.collection::<UtxoByAddressRef>("utxo_by_address")?;
 
-        let addr = [0x77; 20];
+        let addr = [0x77; 33];
 
         // 1) Insert a UTXO => flush to segment
         let utxo1 = make_utxo(0x11, 0, addr, 500);
         main_coll.insert(utxo1.clone(), 10)?;
         addr_coll.insert(make_address_ref(addr, utxo1.tx_id, utxo1.output_index), 10)?;
 
-        println!("making elements 2.");
-
         // Force flush (so that entry is in a segment)
         db.flush_all(10)?;
-
-        println!("fushed elements.");
 
         // 2) Insert a second UTXO but do *not* flush => it remains in memtable
         let utxo2 = make_utxo(0x22, 1, addr, 999);
         main_coll.insert(utxo2.clone(), 11)?;
         addr_coll.insert(make_address_ref(addr, utxo2.tx_id, utxo2.output_index), 11)?;
-
-        println!("inserted elements.");
 
         // 3) Query => Should find both (1 in segment, 1 in memtable)
         let found = addr_coll.find_unspent_utxos_for_address(addr, None, 10, &main_coll)?;
@@ -396,6 +405,207 @@ mod tests_utxo_by_address {
 
         teardown_fs(test_name);
 
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod performance_tests {
+    use super::*;
+    use crate::domain::db::__test__::helpper::{make_test_db, teardown_fs};
+    use crate::domain::generic::errors::OpNetResult;
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    #[test]
+    //#[ignore]
+    fn test_insert_1_million_utxos_random_addresses() -> OpNetResult<()> {
+        let test_name = "perf_1m_utxos_random";
+        let db = make_test_db(test_name, 0)?;
+        db.register_collection("utxo")?;
+        db.register_collection("utxo_by_address")?;
+
+        let main_coll = db.collection::<Utxo>("utxo")?;
+        let addr_coll = db.collection::<UtxoByAddressRef>("utxo_by_address")?;
+
+        let total_utxos = 1_000_000;
+        let block_size = 10_000; // e.g. 100 blocks
+        let mut current_block = 100;
+
+        // We'll pick a single "known" address that we'll use occasionally, so we
+        // can reliably fetch 1000 from it later.
+        let known_address = [0xAA; 33];
+
+        let start_time = Instant::now();
+        let mut total_inserted = 0usize;
+
+        // We'll insert in chunks
+        for chunk_start in (0..total_utxos).step_by(block_size) {
+            let block_start_time = Instant::now();
+
+            for i in chunk_start..(chunk_start + block_size) {
+                // Decide which address to use:
+                //
+                // so we definitely have enough for a final 1000 fetch.
+                let address_chance = (i % 100) == 0; // 1 out of 50 =>
+                let address: [u8; 33] = if address_chance {
+                    known_address
+                } else {
+                    let mut arr = [0u8; 33];
+                    arr[0] = (i & 255) as u8;
+                    arr[1] = ((i >> 8) & 255) as u8;
+                    arr[2] = ((i >> 16) & 255) as u8;
+                    arr[3] = ((i >> 24) & 255) as u8;
+                    arr
+                };
+
+                // Build a unique tx_id
+                let mut txid = [0u8; 32];
+                txid[0] = (i & 0xFF) as u8;
+                txid[1] = ((i >> 8) & 0xFF) as u8;
+                txid[2] = ((i >> 16) & 0xFF) as u8;
+                txid[3] = ((i >> 24) & 0xFF) as u8;
+
+                // Insert
+                let utxo = Utxo {
+                    tx_id: txid,
+                    output_index: i as u32,
+                    address,
+                    amount: 1_000 + i as u64,
+                    script_pubkey: vec![0xAB, 0xCD],
+                    deleted_at_block: None,
+                };
+
+                main_coll.insert(utxo.clone(), current_block)?;
+                addr_coll.insert(
+                    UtxoByAddressRef {
+                        address,
+                        tx_id: txid,
+                        output_index: i as u32,
+                    },
+                    current_block,
+                )?;
+            }
+
+            // Flush after each block
+            db.flush_all(current_block)?;
+
+            total_inserted += block_size;
+            current_block += 1;
+
+            let block_duration = block_start_time.elapsed();
+            println!(
+                "Inserted block of {} UTXOs in {:?} (total so far: {}).",
+                block_size, block_duration, total_inserted
+            );
+        }
+
+        let total_duration = start_time.elapsed();
+        println!(
+            "Inserted {} UTXOs (with random addresses) in {:?}. Average: {:?}/UTXO",
+            total_utxos,
+            total_duration,
+            total_duration / (total_utxos as u32),
+        );
+
+        // Now let's fetch up to 1000 from the "known" address:
+        let fetch_start = Instant::now();
+        let found =
+            addr_coll.find_unspent_utxos_for_address(known_address, None, 1000, &main_coll)?;
+        let fetch_time = fetch_start.elapsed();
+        println!(
+            "Fetched up to 1000 unspent from known address in {:?}. Found {} total.",
+            fetch_time,
+            found.len()
+        );
+        assert!(
+            found.len() >= 1000,
+            "We expect to find at least 1000 in the known address"
+        );
+
+        teardown_fs(test_name);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore]
+    fn test_insert_1_million_in_parallel() -> OpNetResult<()> {
+        let test_name = "perf_1m_parallel";
+        let db = make_test_db(test_name, 0)?;
+        db.register_collection("utxo")?;
+        db.register_collection("utxo_by_address")?;
+
+        let main_coll = Arc::new(db.collection::<Utxo>("utxo")?);
+        let addr_coll = Arc::new(db.collection::<UtxoByAddressRef>("utxo_by_address")?);
+
+        let total_utxos = 1_000_000;
+        let num_threads = 4;
+        let utxos_per_thread = total_utxos / num_threads;
+
+        // Start timing
+        let start_time = std::time::Instant::now();
+
+        let mut handles = Vec::new();
+
+        for t_id in 0..num_threads {
+            let main_clone = Arc::clone(&main_coll);
+            let addr_clone = Arc::clone(&addr_coll);
+
+            let handle = std::thread::spawn(move || -> OpNetResult<()> {
+                let start_i = t_id * utxos_per_thread;
+                let end_i = start_i + utxos_per_thread;
+
+                // We'll just use a single block for each thread in this example
+                let block_height = 1000 + t_id as u64;
+
+                for i in start_i..end_i {
+                    let mut txid = [0u8; 32];
+                    txid[0] = (i & 0xFF) as u8;
+                    txid[1] = ((i >> 8) & 0xFF) as u8;
+                    txid[2] = ((i >> 16) & 0xFF) as u8;
+                    txid[3] = ((i >> 24) & 0xFF) as u8;
+
+                    // Use a random or static address
+                    let address = [t_id as u8; 33]; // each thread uses different address
+                    let utxo = Utxo {
+                        tx_id: txid,
+                        output_index: i as u32,
+                        address,
+                        amount: 9999,
+                        script_pubkey: vec![0xAB, 0xCD],
+                        deleted_at_block: None,
+                    };
+
+                    main_clone.insert(utxo.clone(), block_height)?;
+                    let addr_ref = UtxoByAddressRef {
+                        address,
+                        tx_id: utxo.tx_id,
+                        output_index: utxo.output_index,
+                    };
+                    addr_clone.insert(addr_ref, block_height)?;
+                }
+
+                // Done
+                Ok(())
+            });
+            handles.push(handle);
+        }
+
+        // Join all threads
+        for h in handles {
+            h.join().unwrap()?;
+        }
+
+        // Then flush everything once at the end, if desired
+        db.flush_all(2000)?;
+
+        let elapsed = start_time.elapsed();
+        println!(
+            "Inserted {} UTXOs in parallel with {} threads in {:?}",
+            total_utxos, num_threads, elapsed
+        );
+
+        teardown_fs(test_name);
         Ok(())
     }
 }
