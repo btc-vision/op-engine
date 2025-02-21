@@ -1,4 +1,4 @@
-# OP-Engine: A High-Throughput, Reorg-Aware Storage Layer (Rust)
+# OP-Engine: Reorg-Aware Storage Layer (Rust)
 
 ![Rust](https://img.shields.io/badge/rust-%23000000.svg?style=for-the-badge&logo=rust&logoColor=white)
 ![Bitcoin](https://img.shields.io/badge/Bitcoin-000?style=for-the-badge&logo=bitcoin&logoColor=white)
